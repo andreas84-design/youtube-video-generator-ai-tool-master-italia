@@ -561,7 +561,7 @@ def generate():
                 "-shortest",
                 final_video_path,
             ],
-            timeout=300,
+            timeout=600,
             check=True,
         )
 
