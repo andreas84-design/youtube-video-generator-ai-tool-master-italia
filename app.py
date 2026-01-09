@@ -27,7 +27,7 @@ R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY")
 
-# 🔥 WEBHOOK n8n
+# 🔥 WEBHOOK n8n (fallback)
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")
 
 # 🔥 In-memory job storage (upgrade to Redis in produzione!)
@@ -211,6 +211,10 @@ def process_video_async(job_id: str, data: dict):
         print(f"🎬 [{job_id}] START processing...", flush=True)
         jobs[job_id]['status'] = 'processing'
 
+        # 🔥 DYNAMIC WEBHOOK dal Body n8n!
+        webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
+        jobs[job_id]['webhook_url'] = webhook_url  # Salva per status check
+
         audiobase64 = data.get("audio_base64") or data.get("audiobase64")
         raw_script = data.get("script") or data.get("script_chunk") or data.get("script_audio") or data.get("script_completo") or ""
         script = " ".join(str(p).strip() for p in raw_script) if isinstance(raw_script, list) else str(raw_script).strip()
@@ -349,8 +353,8 @@ def process_video_async(job_id: str, data: dict):
         jobs[job_id]['duration'] = real_duration
         jobs[job_id]['clips_used'] = len(scene_paths)
 
-        # 🔥 WEBHOOK CALLBACK A n8n!
-        if N8N_WEBHOOK_URL:
+        # 🔥 WEBHOOK CALLBACK al webhook n8n specifico!
+        if webhook_url:
             try:
                 callback_payload = {
                     'job_id': job_id,
@@ -360,8 +364,8 @@ def process_video_async(job_id: str, data: dict):
                     'clips_used': len(scene_paths),
                     'original_data': data
                 }
-                resp = requests.post(N8N_WEBHOOK_URL, json=callback_payload, timeout=30)
-                print(f"🔔 [{job_id}] Webhook callback sent! Status: {resp.status_code}", flush=True)
+                resp = requests.post(webhook_url, json=callback_payload, timeout=30)
+                print(f"🔔 [{job_id}] Callback a {webhook_url}: {resp.status_code}", flush=True)
             except Exception as e:
                 print(f"⚠️  [{job_id}] Webhook callback failed: {e}", flush=True)
 
@@ -378,9 +382,10 @@ def process_video_async(job_id: str, data: dict):
                 pass
 
         # Webhook error callback
-        if N8N_WEBHOOK_URL:
+        webhook_url = jobs[job_id].get('webhook_url')
+        if webhook_url:
             try:
-                requests.post(N8N_WEBHOOK_URL, json={'job_id': job_id, 'status': 'failed', 'error': str(e), 'original_data': data}, timeout=30)
+                requests.post(webhook_url, json={'job_id': job_id, 'status': 'failed', 'error': str(e), 'original_data': data}, timeout=30)
             except Exception:
                 pass
 
@@ -402,10 +407,12 @@ def generate():
         data = request.get_json(force=True) or {}
         job_id = str(uuid.uuid4())
 
-        # Salva job
+        # 🔥 Salva job con webhook dinamico
+        webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
         jobs[job_id] = {
             'status': 'queued',
             'data': data,
+            'webhook_url': webhook_url,  # ✅ Salva webhook specifico!
             'created_at': dt.datetime.utcnow().isoformat()
         }
 
@@ -414,14 +421,15 @@ def generate():
         thread.daemon = True
         thread.start()
 
-        print(f"🚀 [{job_id}] Job created! Processing in background...", flush=True)
+        print(f"🚀 [{job_id}] Job created! Webhook: {webhook_url}", flush=True)
 
         # Risposta IMMEDIATA (< 1 secondo!)
         return jsonify({
             "success": True,
             "job_id": job_id,
             "status": "processing",
-            "message": "Video generation started. You will receive webhook callback when ready."
+            "webhook_url": webhook_url,
+            "message": "Video generation started. Callback when ready."
         }), 202
 
     except Exception as e:
@@ -439,6 +447,7 @@ def get_status(job_id):
     response = {
         'job_id': job_id,
         'status': job['status'],
+        'webhook_url': job.get('webhook_url'),
         'created_at': job.get('created_at')
     }
 
@@ -455,4 +464,3 @@ def get_status(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-    
