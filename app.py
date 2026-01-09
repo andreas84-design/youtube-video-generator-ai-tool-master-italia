@@ -12,492 +12,300 @@ from botocore.config import Config
 import math
 import random
 from threading import Thread
-import gspread  # 🔥 AGGIUNTO
-from google.oauth2 import service_account  # 🔥 AGGIUNTO
+import logging
+
+# Logging esteso Railway
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Config R2 (S3 compatibile)
+# Config R2 con fallback
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_REGION = os.environ.get("R2_REGION", "auto")
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 
-# 🔥 GOOGLE SHEETS PER COLONNA M
-GOOGLE_SHEETS_ROW_SHEET_ID = os.environ.get("GOOGLE_SHEETS_ROW_SHEET_ID")  # 🔥 AGGIUNTO: ID Sheet B
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # 🔥 AGGIUNTO: base64 JSON
+# API fallback
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 
-# Pexels / Pixabay API
-PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
-PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY")
-
-# 🔥 WEBHOOK n8n (fallback)
-N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")
-
-# 🔥 In-memory job storage (upgrade to Redis in produzione!)
+# Job storage limitato (max 50 per anti-memoria)
 jobs = {}
-
+MAX_JOBS = 50
 
 def get_s3_client():
-    """Client S3 configurato per Cloudflare R2"""
-    if R2_ACCOUNT_ID:
+    """R2 client con fallback"""
+    try:
+        if not R2_ACCOUNT_ID:
+            raise RuntimeError("R2_ACCOUNT_ID mancante")
         endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    else:
-        endpoint_url = None
-
-    if endpoint_url is None:
-        raise RuntimeError("Endpoint R2 non configurato: imposta R2_ACCOUNT_ID in Railway")
-
-    session = boto3.session.Session()
-    s3_client = session.client(
-        service_name="s3",
-        region_name=R2_REGION,
-        endpoint_url=endpoint_url,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(s3={"addressing_style": "virtual"}),
-    )
-    return s3_client
-
-
-def update_sheets_video_url(video_url: str, row_number):
-    """🔥 SALVA video_url in colonna M del Google Sheet workflow B (ANTI-CRASH)"""
-    if not all([GOOGLE_SHEETS_ROW_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON]):
-        print("⚠️  Sheets env mancanti → Skip (aggiungi Railway vars)", flush=True)
-        return
-    
-    try:
-        row_number = int(row_number)
-        creds_json = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON).decode()
-        creds = service_account.Credentials.from_service_account_info(json.loads(creds_json))
         
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEETS_ROW_SHEET_ID).sheet1  # Cambia se nome foglio diverso
-        
-        sheet.update_acell(f'M{row_number}', video_url)
-        print(f"✅ Video URL salvato in M{row_number}: {video_url[:80]}...", flush=True)
-    except ValueError:
-        print(f"⚠️  row_number invalido: {row_number}", flush=True)
+        session = boto3.session.Session()
+        return session.client(
+            's3',
+            region_name=R2_REGION,
+            endpoint_url=endpoint_url,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version='s3v4', addressing_style='virtual')
+        )
     except Exception as e:
-        print(f"⚠️  Errore Sheets M{row_number}: {e}", flush=True)
+        logger.error(f"R2 client fail: {e}")
+        raise
 
-
-def cleanup_old_videos(s3_client, current_key):
-    """Cancella tutti i video MP4 in R2 TRANNE quello appena caricato"""
-    try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="videos/")
-
-        deleted_count = 0
-        for page in pages:
-            if "Contents" not in page:
-                continue
-
-            for obj in page["Contents"]:
-                key = obj["Key"]
-                if key.endswith(".mp4") and key != current_key:
-                    s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-                    deleted_count += 1
-                    print(f"🗑️  Cancellato vecchio video: {key}", flush=True)
-
-        if deleted_count > 0:
-            print(f"✅ Rotazione completata: {deleted_count} video vecchi rimossi", flush=True)
-        else:
-            print("✅ Nessun video vecchio da rimuovere", flush=True)
-
-    except Exception as e:
-        print(f"⚠️  Errore rotazione R2 (video vecchi restano): {str(e)}", flush=True)
-
+def cleanup_jobs():
+    """Limita jobs in memoria"""
+    global jobs
+    if len(jobs) > MAX_JOBS:
+        old_keys = sorted(jobs.keys(), key=lambda k: jobs[k].get('created_at', ''))[:len(jobs)-MAX_JOBS]
+        for k in old_keys:
+            del jobs[k]
+        logger.info(f"Cleanup: {len(old_keys)} old jobs rimossi")
 
 def pick_visual_query(context: str, keywords_text: str = "") -> str:
-    """Query ottimizzate per B‑roll tech"""
     ctx = (context or "").lower()
     kw = (keywords_text or "").lower()
+    base = "ai workstation laptop coding workflow office technology screens"
+    
+    queries = {
+        "produttivit": "person laptop automation workflow modern office productivity ai interface",
+        "prompt": "computer screen chat interface prompt dark background green code",
+        "n8n": "monitor flowchart automation nodes glowing lines dark tech",
+        "excel": "spreadsheet laptop charts tables clean desk",
+        "tastiera": "desk laptop stand ergonomic keyboard mouse rgb lights",
+        "libro": "book laptop ai interface notes cozy learning"
+    }
+    
+    for key, q in queries.items():
+        if key in ctx:
+            return q
+    
+    return f"{kw} laptop computer screen coding office" if kw else base
 
-    base = "ai workstation, laptop, coding, workflow, office, technology, screens"
-
-    if any(w in ctx for w in ["produttivit", "lavoro", "task", "automat", "workflow", "routine"]):
-        return "person at laptop automation workflow screen, modern office, productivity, ai interface"
-
-    if any(w in ctx for w in ["prompt", "chatgpt", "gpt", "llm", "modello linguistico"]):
-        return "close up of computer screen with chat interface, prompt highlighted, dark background, green code"
-
-    if any(w in ctx for w in ["n8n", "webhook", "api", "integrazione", "scenario", "flow"]):
-        return "monitor with colorful flowchart automation nodes, glowing lines connecting apps, dark tech background"
-
-    if any(w in ctx for w in ["excel", "foglio", "sheets", "google sheets", "dati", "report", "tabella"]):
-        return "person working on spreadsheet on laptop, charts and tables on screen, clean office desk"
-
-    if any(w in ctx for w in ["tastiera", "mouse", "supporto", "laptop", "webcam", "monitor"]):
-        return "minimal desk setup with laptop on stand, ergonomic keyboard and mouse, soft rgb lights, tech workspace"
-
-    if any(w in ctx for w in ["libro", "studia", "formazione", "corso", "lezione", "impara"]):
-        return "open book next to laptop with ai interface, notes and highlighters on desk, cozy learning environment"
-
-    if kw and kw != "none":
-        return f"{kw}, modern office, laptop, screens, technology"
-
-    return base
-
-
-def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: float):
-    """Fetch B-roll tech clips"""
-    target_duration = min(4.0, avg_scene_duration)
-
-    def is_tech_video_metadata(video_data, source):
-        banned = ["dog", "cat", "animal", "wildlife", "bird", "fish", "horse", "fitness", "yoga", "workout", "kitchen", "cooking", "food"]
-        if source == "pexels":
-            text = (video_data.get("description", "") + " " + " ".join(video_data.get("tags", []))).lower()
-        else:
-            text = " ".join(video_data.get("tags", [])).lower()
-
-        has_banned = any(kw in text for kw in banned)
-        return not has_banned
-
+def fetch_clip_for_scene(scene_number: int, query: str, avg_duration: float):
+    """Fetch clip con timeout"""
+    target_duration = min(4.0, avg_duration)
+    
     def download_file(url: str) -> str:
         tmp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        clip_resp = requests.get(url, stream=True, timeout=30)
-        clip_resp.raise_for_status()
-        for chunk in clip_resp.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                tmp_clip.write(chunk)
-        tmp_clip.close()
-        return tmp_clip.name
-
-    def try_pexels():
-        if not PEXELS_API_KEY:
-            return None
-        headers = {"Authorization": PEXELS_API_KEY}
-        params = {
-            "query": f"{query} laptop computer screen coding technology office",
-            "orientation": "landscape",
-            "per_page": 25,
-            "page": random.randint(1, 3),
-        }
-        resp = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=20)
-        if resp.status_code != 200:
-            return None
-
-        videos = resp.json().get("videos", [])
-        tech_videos = [v for v in videos if is_tech_video_metadata(v, "pexels")]
-
-        if tech_videos:
-            video = random.choice(tech_videos)
-            for vf in video.get("video_files", []):
-                if vf.get("width", 0) >= 1280:
-                    return download_file(vf["link"])
-        return None
-
-    def try_pixabay():
-        if not PIXABAY_API_KEY:
-            return None
-        params = {
-            "key": PIXABAY_API_KEY,
-            "q": f"{query} laptop computer screen coding technology office",
-            "per_page": 25,
-            "safesearch": "true",
-            "min_width": 1280,
-        }
-        resp = requests.get("https://pixabay.com/api/videos/", params=params, timeout=20)
-        if resp.status_code != 200:
-            return None
-
-        hits = resp.json().get("hits", [])
-        for hit in hits:
-            if is_tech_video_metadata(hit, "pixabay"):
-                videos = hit.get("videos", {})
-                for quality in ["large", "medium", "small"]:
-                    if quality in videos and "url" in videos[quality]:
-                        return download_file(videos[quality]["url"])
-        return None
-
-    for source_name, func in [("Pexels", try_pexels), ("Pixabay", try_pixabay)]:
         try:
-            path = func()
-            if path:
-                print(f"🎥 Scena {scene_number}: '{query[:40]}...' → {source_name} ✓", flush=True)
-                return path, target_duration
-        except Exception as e:
-            print(f"⚠️ {source_name}: {e}", flush=True)
-
-    print(f"⚠️ NO CLIP per scena {scene_number}: '{query}'", flush=True)
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+            for chunk in resp.iter_content(1024*1024):
+                if chunk: tmp_clip.write(chunk)
+            tmp_clip.close()
+            return tmp_clip.name
+        except:
+            try: os.unlink(tmp_clip.name)
+            except: pass
+            return None
+    
+    # Pexels
+    if PEXELS_API_KEY:
+        try:
+            resp = requests.get("https://api.pexels.com/videos/search", 
+                              headers={"Authorization": PEXELS_API_KEY},
+                              params={"query": query, "orientation": "landscape", "per_page": 15, "page": random.randint(1,3)},
+                              timeout=20)
+            if resp.status_code == 200:
+                videos = resp.json().get("videos", [])
+                if videos:
+                    vf = random.choice(videos)["video_files"][0]
+                    path = download_file(vf["link"])
+                    if path: return path, target_duration
+        except: pass
+    
+    # Pixabay fallback
+    if PIXABAY_API_KEY:
+        try:
+            resp = requests.get("https://pixabay.com/api/videos/", 
+                              params={"key": PIXABAY_API_KEY, "q": query, "per_page": 15, "min_width": 1280},
+                              timeout=20)
+            if resp.status_code == 200:
+                for hit in resp.json().get("hits", []):
+                    url = hit["videos"].get("medium", {}).get("url")
+                    if url:
+                        path = download_file(url)
+                        if path: return path, target_duration
+        except: pass
+    
+    logger.warning(f"No clip scena {scene_number}: {query}")
     return None, None
 
-
-# 🔥 ASYNC VIDEO PROCESSING
 def process_video_async(job_id: str, data: dict):
-    """Background thread per generazione video (può durare 20+ minuti!)"""
-    audiopath = None
-    audio_wav_path = None
-    video_looped_path = None
-    final_video_path = None
+    """Processo principale con try/except totali"""
+    audiopath = video_looped_path = final_video_path = None
     scene_paths = []
-
+    
     try:
-        print(f"🎬 [{job_id}] START processing...", flush=True)
-        jobs[job_id]['status'] = 'processing'
-
-        # 🔥 DYNAMIC WEBHOOK dal Body n8n!
+        logger.info(f"[{job_id}] START | Row: {data.get('row_number', 'N/A')}")
+        cleanup_jobs()
+        jobs[job_id] = {'status': 'processing', 'created_at': dt.datetime.utcnow().isoformat(), 'data': data}
+        
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        jobs[job_id]['webhook_url'] = webhook_url  # Salva per status check
-
-        # 🔥 ROW NUMBER dal job n8n/Sheets MASTER
-        row_number = int(data.get('row_number') or data.get('RowID') or 1)  # 🔥 AGGIUNTO
-
-        audiobase64 = data.get("audio_base64") or data.get("audiobase64")
-        raw_script = data.get("script") or data.get("script_chunk") or data.get("script_audio") or data.get("script_completo") or ""
-        script = " ".join(str(p).strip() for p in raw_script) if isinstance(raw_script, list) else str(raw_script).strip()
-
-        raw_keywords = data.get("keywords", "")
-        sheet_keywords = ", ".join(str(k).strip() for k in raw_keywords) if isinstance(raw_keywords, list) else str(raw_keywords).strip()
-
-        if not audiobase64:
-            raise ValueError("audiobase64 mancante")
-
-        # Audio processing
-        audio_bytes = base64.b64decode(audiobase64)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
-            f.write(audio_bytes)
-            audiopath_tmp = f.name
-
-        audio_wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        audio_wav_path = audio_wav_tmp.name
-        audio_wav_tmp.close()
-
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", audiopath_tmp, "-acodec", "pcm_s16le", "-ar", "48000", audio_wav_path], timeout=60, check=True)
-        os.unlink(audiopath_tmp)
-        audiopath = audio_wav_path
-
-        # Duration
-        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audiopath], stdout=subprocess.PIPE, text=True, timeout=10)
-        real_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 720.0
-
-        print(f"⏱️  [{job_id}] Durata: {real_duration/60:.1f}min | Riga: {row_number}", flush=True)
-
-        # Scene sync
-        script_words = script.lower().split()
-        words_per_second = len(script_words) / real_duration if real_duration > 0 else 2.5
-        avg_scene_duration = real_duration / 25
-
+        row_number = int(data.get('row_number') or data.get('RowID') or 1)
+        jobs[job_id]['webhook_url'] = webhook_url
+        jobs[job_id]['row_number'] = row_number
+        
+        # Audio decode/normalize
+        audio_bytes = base64.b64decode(data.get("audio_base64") or "")
+        audiopath = tempfile.mktemp(suffix='.wav')
+        with open(audiopath, 'wb') as f:
+            subprocess.run(["ffmpeg", "-y", "-i", f"data:audio/mp3;base64,{data['audio_base64']}", 
+                          "-acodec", "pcm_s16le", "-ar", "48000", audiopath], 
+                         timeout=120, check=True, capture_output=True)
+        
+        # Durata reale
+        duration_cmd = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", 
+                                     "-of", "default=nw=1:nk=1", audiopath], 
+                                    stdout=subprocess.PIPE, text=True, timeout=10)
+        real_duration = float(duration_cmd.stdout.strip() or 720)
+        
+        logger.info(f"[{job_id}] Durata: {real_duration/60:.1f}m | Words: {len(data.get('script',''))}")
+        
+        # Scene (max 20 anti-timeout)
+        avg_scene_dur = real_duration / 20
         scene_assignments = []
-        for i in range(25):
-            timestamp = i * avg_scene_duration
-            word_index = int(timestamp * words_per_second)
-            scene_context = " ".join(script_words[word_index: word_index + 7]) if word_index < len(script_words) else "ai workstation laptop coding workflow"
-            scene_query = pick_visual_query(scene_context, sheet_keywords)
-            scene_assignments.append({"scene": i + 1, "timestamp": round(timestamp, 1), "context": scene_context[:60], "query": scene_query[:80]})
-
-        # Download clips
-        for assignment in scene_assignments:
-            clip_path, clip_dur = fetch_clip_for_scene(assignment["scene"], assignment["query"], avg_scene_duration)
-            if clip_path and clip_dur:
-                scene_paths.append((clip_path, clip_dur))
-
-        print(f"✅ [{job_id}] CLIPS: {len(scene_paths)}/25", flush=True)
-
-        if len(scene_paths) < 5:
-            raise RuntimeError(f"Troppe poche clip: {len(scene_paths)}/25")
-
-        # Normalize + concat + merge (tuo code esistente)
+        script_words = (data.get("script", "") or "").lower().split()
+        words_per_sec = max(len(script_words) / real_duration, 2.5)
+        
+        for i in range(20):
+            ts = i * avg_scene_dur
+            word_idx = int(ts * words_per_sec)
+            context = " ".join(script_words[word_idx:word_idx+7]) if word_idx < len(script_words) else ""
+            query = pick_visual_query(context, data.get("keywords", ""))
+            scene_assignments.append({"query": query})
+        
+        # Download clips (max 20)
+        for assign in scene_assignments:
+            path, _ = fetch_clip_for_scene(len(scene_paths)+1, assign["query"], avg_scene_dur)
+            if path:
+                scene_paths.append(path)
+            if len(scene_paths) >= 15: break  # Limite anti-mem
+        
+        logger.info(f"[{job_id}] Clips: {len(scene_paths)}/20")
+        if len(scene_paths) < 3:
+            raise RuntimeError("Clip insufficienti")
+        
+        # Normalize clips
         normalized_clips = []
-        for i, (clip_path, _dur) in enumerate(scene_paths):
+        for i, path in enumerate(scene_paths[:15]):
+            norm_path = tempfile.mktemp(suffix='.mp4')
             try:
-                normalized_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                normalized_path = normalized_tmp.name
-                normalized_tmp.close()
-
-                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", clip_path, "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an", normalized_path], timeout=120, check=True)
-
-                if os.path.exists(normalized_path) and os.path.getsize(normalized_path) > 1000:
-                    normalized_clips.append(normalized_path)
-            except Exception:
-                pass
-
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, 
+                              "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30", 
+                              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", norm_path], 
+                             timeout=90, check=True, capture_output=True)
+                if os.path.exists(norm_path) and os.path.getsize(norm_path) > 50000:
+                    normalized_clips.append(norm_path)
+            except:
+                try: os.unlink(norm_path)
+                except: pass
+        
         if not normalized_clips:
-            raise RuntimeError("Nessuna clip normalizzata")
-
-        # Concat
-        def get_duration(p):
-            out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p], stdout=subprocess.PIPE, text=True, timeout=10).stdout.strip()
-            return float(out or 4.0)
-
-        total_clips_duration = sum(get_duration(p) for p in normalized_clips)
-
-        concat_list_tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
-        entries_written = 0
-        MAX_CONCAT_ENTRIES = 150
-
-        if total_clips_duration < real_duration and len(normalized_clips) > 1:
-            loops_needed = math.ceil(real_duration / total_clips_duration)
-            for _ in range(loops_needed):
-                for norm_path in normalized_clips:
-                    if entries_written >= MAX_CONCAT_ENTRIES:
-                        break
-                    concat_list_tmp.write(f"file '{norm_path}'\n")
-                    entries_written += 1
-                if entries_written >= MAX_CONCAT_ENTRIES:
-                    break
-        else:
-            for norm_path in normalized_clips:
-                concat_list_tmp.write(f"file '{norm_path}'\n")
-                entries_written += 1
-
-        concat_list_tmp.close()
-
-        video_looped_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        video_looped_path = video_looped_tmp.name
-        video_looped_tmp.close()
-
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat_list_tmp.name, "-vf", "fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-t", str(real_duration), video_looped_path], timeout=600, check=True)
-        os.unlink(concat_list_tmp.name)
-
-        # Final merge
-        final_video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        final_video_path = final_video_tmp.name
-        final_video_tmp.close()
-
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", video_looped_path, "-i", audiopath, "-filter_complex", "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p[v]", "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "192k", "-shortest", final_video_path], timeout=600, check=True)
-
+            raise RuntimeError("Nessuna clip valida")
+        
+        logger.info(f"[{job_id}] Normalized: {len(normalized_clips)}")
+        
+        # Concat list (loop se necessario)
+        concat_list = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt').name
+        with open(concat_list, 'w') as f:
+            total_dur = sum(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", 
+                                          "-of", "csv=p=0", p], stdout=subprocess.PIPE, text=True, 
+                                         timeout=10).stdout.strip() for p in normalized_clips)
+            loops = max(1, math.ceil(real_duration / total_dur))
+            for _ in range(min(loops, 3)):  # Max 3 loop
+                for p in normalized_clips:
+                    f.write(f"file '{p}'\n")
+        
+        # Video looped
+        video_looped_path = tempfile.mktemp(suffix='.mp4')
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, 
+                      "-c", "copy", "-t", str(real_duration), video_looped_path], 
+                     timeout=300, check=True, capture_output=True)
+        os.unlink(concat_list)
+        
+        # Final merge audio+video
+        final_video_path = tempfile.mktemp(suffix='.mp4')
+        subprocess.run(["ffmpeg", "-y", "-i", video_looped_path, "-i", audiopath, 
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", 
+                      "-c:a", "aac", "-shortest", final_video_path], 
+                     timeout=300, check=True, capture_output=True)
+        
         # R2 upload
-        s3_client = get_s3_client()
-        today = dt.datetime.utcnow().strftime("%Y-%m-%d")
-        object_key = f"videos/{today}/{uuid.uuid4().hex}.mp4"
-
-        s3_client.upload_file(Filename=final_video_path, Bucket=R2_BUCKET_NAME, Key=object_key, ExtraArgs={"ContentType": "video/mp4"})
-        public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
-        cleanup_old_videos(s3_client, object_key)
-
-        # 🔥 SALVA URL IN SHEETS COLONNA M (PRIMA del webhook!)
-        update_sheets_video_url(public_url, row_number)
-
+        s3 = get_s3_client()
+        key = f"videos/{dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}_{job_id}.mp4"
+        s3.upload_file(final_video_path, R2_BUCKET_NAME, key, ExtraArgs={'ContentType': 'video/mp4'})
+        public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+        
         # Cleanup
-        for path in [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-
-        print(f"✅ [{job_id}] VIDEO COMPLETO: {public_url}", flush=True)
-
-        # Update job
-        jobs[job_id]['status'] = 'completed'
-        jobs[job_id]['video_url'] = public_url
-        jobs[job_id]['duration'] = real_duration
-        jobs[job_id]['clips_used'] = len(scene_paths)
-        jobs[job_id]['row_number'] = row_number  # 🔥 AGGIUNTO
-
-        # 🔥 WEBHOOK CALLBACK al webhook n8n specifico! (fallback)
+        for path in [audiopath, video_looped_path, final_video_path] + normalized_clips + scene_paths:
+            try: os.unlink(path)
+            except: pass
+        
+        # Job success + webhook
+        jobs[job_id].update({
+            'status': 'completed', 'video_url': public_url, 
+            'duration': real_duration, 'clips_used': len(scene_paths)
+        })
+        logger.info(f"[{job_id}] SUCCESS: {public_url}")
+        
         if webhook_url:
             try:
-                callback_payload = {
-                    'job_id': job_id,
-                    'status': 'completed',
-                    'video_url': public_url,
-                    'row_number': row_number,  # 🔥 AGGIUNTO
-                    'duration': real_duration,
-                    'clips_used': len(scene_paths),
-                    'original_data': data
-                }
-                resp = requests.post(webhook_url, json=callback_payload, timeout=30)
-                print(f"🔔 [{job_id}] Callback a {webhook_url}: {resp.status_code}", flush=True)
-            except Exception as e:
-                print(f"⚠️  [{job_id}] Webhook callback failed: {e}", flush=True)
-
+                requests.post(webhook_url, json={
+                    'jobid': job_id, 'status': 'completed', 'videourl': public_url,
+                    'duration': real_duration, 'clipsused': len(scene_paths),
+                    'row_number': row_number, 'originaldata': data
+                }, timeout=10)
+            except: logger.error(f"Webhook fail: {webhook_url}")
+            
     except Exception as e:
-        print(f"❌ [{job_id}] ERROR: {e}", flush=True)
+        logger.error(f"[{job_id}] FAIL: {str(e)}")
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['error'] = str(e)
-
-        # Cleanup
-        for path in [audiopath, audio_wav_path, video_looped_path, final_video_path] + [p[0] for p in scene_paths]:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-
-        # Webhook error callback
-        webhook_url = jobs[job_id].get('webhook_url')
+        
         if webhook_url:
             try:
-                requests.post(webhook_url, json={'job_id': job_id, 'status': 'failed', 'error': str(e), 'original_data': data}, timeout=30)
-            except Exception:
-                pass
-
-
-@app.route("/ffmpeg-test", methods=["GET"])
-def ffmpeg_test():
-    result = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    firstline = result.stdout.splitlines()[0] if result.stdout else "no output"
-    return jsonify({"ffmpeg_output": firstline})
-
+                requests.post(webhook_url, json={'jobid': job_id, 'status': 'failed', 'error': str(e)}, timeout=10)
+            except: pass
+        
+        # Cleanup fail
+        for path in [audiopath, video_looped_path, final_video_path, *([p[0] for p in getattr(scene_paths, 'values', lambda: [])()])]:
+            try: os.unlink(path)
+            except: pass
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    """🔥 ASYNC ENDPOINT: risponde subito con job_id!"""
-    try:
-        if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_BASE_URL]):
-            return jsonify({"success": False, "error": "Config R2 mancante", "video_url": None}), 500
-
-        data = request.get_json(force=True) or {}
-        job_id = str(uuid.uuid4())
-
-        # 🔥 Salva job con webhook dinamico
-        webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        jobs[job_id] = {
-            'status': 'queued',
-            'data': data,
-            'webhook_url': webhook_url,  # ✅ Salva webhook specifico!
-            'created_at': dt.datetime.utcnow().isoformat()
-        }
-
-        # 🔥 Start background thread!
-        thread = Thread(target=process_video_async, args=(job_id, data))
-        thread.daemon = True
-        thread.start()
-
-        print(f"🚀 [{job_id}] Job created! Webhook: {webhook_url} | Riga: {data.get('row_number')}", flush=True)
-
-        # Risposta IMMEDIATA (< 1 secondo!)
-        return jsonify({
-            "success": True,
-            "job_id": job_id,
-            "status": "processing",
-            "webhook_url": webhook_url,
-            "message": "Video generation started. Callback when ready."
-        }), 202
-
-    except Exception as e:
-        print(f"❌ Job creation error: {e}", flush=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-
+    data = request.get_json() or {}
+    job_id = str(uuid.uuid4())
+    
+    if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
+        return jsonify({'success': False, 'error': 'R2 config mancante'}), 500
+    
+    jobs[job_id] = {'status': 'queued'}
+    Thread(target=process_video_async, args=(job_id, data), daemon=True).start()
+    
+    logger.info(f"Job queued: {job_id}")
+    return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 202
 
 @app.route("/status/<job_id>", methods=["GET"])
-def get_status(job_id):
-    """Endpoint per check status (fallback se webhook fallisce)"""
-    if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
-
-    job = jobs[job_id]
-    response = {
-        'job_id': job_id,
-        'status': job['status'],
-        'webhook_url': job.get('webhook_url'),
-        'created_at': job.get('created_at')
-    }
-
+def status(job_id):
+    job = jobs.get(job_id, {'status': 'not_found'})
+    resp = {'jobid': job_id, 'status': job['status']}
     if job['status'] == 'completed':
-        response['video_url'] = job.get('video_url')
-        response['duration'] = job.get('duration')
-        response['clips_used'] = job.get('clips_used')
-        response['row_number'] = job.get('row_number')  # 🔥 AGGIUNTO
+        resp.update({k: job[k] for k in ['video_url', 'duration', 'clips_used', 'row_number']})
     elif job['status'] == 'failed':
-        response['error'] = job.get('error')
+        resp['error'] = job.get('error')
+    return jsonify(resp)
 
-    return jsonify(response)
-
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({'status': 'ok', 'jobs': len(jobs)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
