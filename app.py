@@ -62,20 +62,26 @@ def get_s3_client():
     return s3_client
 
 
-def update_sheets_video_url(video_url: str, row_number: int):
-    """🔥 SALVA video_url in colonna M del Google Sheet workflow B"""
+def update_sheets_video_url(video_url: str, row_number):
+    """🔥 SALVA video_url in colonna M del Google Sheet workflow B (ANTI-CRASH)"""
+    if not all([GOOGLE_SHEETS_ROW_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON]):
+        print("⚠️  Sheets env mancanti → Skip (aggiungi Railway vars)", flush=True)
+        return
+    
     try:
+        row_number = int(row_number)
         creds_json = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON).decode()
         creds = service_account.Credentials.from_service_account_info(json.loads(creds_json))
         
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEETS_ROW_SHEET_ID).sheet1  # Cambia 'sheet1' se nome diverso
+        sheet = client.open_by_key(GOOGLE_SHEETS_ROW_SHEET_ID).sheet1  # Cambia se nome foglio diverso
         
-        # Aggiorna SOLO cella M{row_number}
         sheet.update_acell(f'M{row_number}', video_url)
         print(f"✅ Video URL salvato in M{row_number}: {video_url[:80]}...", flush=True)
+    except ValueError:
+        print(f"⚠️  row_number invalido: {row_number}", flush=True)
     except Exception as e:
-        print(f"❌ Errore Sheets M{row_number}: {e}", flush=True)
+        print(f"⚠️  Errore Sheets M{row_number}: {e}", flush=True)
 
 
 def cleanup_old_videos(s3_client, current_key):
