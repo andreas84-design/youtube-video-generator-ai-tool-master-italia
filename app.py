@@ -12,6 +12,8 @@ from botocore.config import Config
 import math
 import random
 from threading import Thread
+import gspread  # 🔥 AGGIUNTO
+from google.oauth2 import service_account  # 🔥 AGGIUNTO
 
 app = Flask(__name__)
 
@@ -22,6 +24,10 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
 R2_REGION = os.environ.get("R2_REGION", "auto")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+
+# 🔥 GOOGLE SHEETS PER COLONNA M
+GOOGLE_SHEETS_ROW_SHEET_ID = os.environ.get("GOOGLE_SHEETS_ROW_SHEET_ID")  # 🔥 AGGIUNTO: ID Sheet B
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # 🔥 AGGIUNTO: base64 JSON
 
 # Pexels / Pixabay API
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
@@ -54,6 +60,22 @@ def get_s3_client():
         config=Config(s3={"addressing_style": "virtual"}),
     )
     return s3_client
+
+
+def update_sheets_video_url(video_url: str, row_number: int):
+    """🔥 SALVA video_url in colonna M del Google Sheet workflow B"""
+    try:
+        creds_json = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON).decode()
+        creds = service_account.Credentials.from_service_account_info(json.loads(creds_json))
+        
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEETS_ROW_SHEET_ID).sheet1  # Cambia 'sheet1' se nome diverso
+        
+        # Aggiorna SOLO cella M{row_number}
+        sheet.update_acell(f'M{row_number}', video_url)
+        print(f"✅ Video URL salvato in M{row_number}: {video_url[:80]}...", flush=True)
+    except Exception as e:
+        print(f"❌ Errore Sheets M{row_number}: {e}", flush=True)
 
 
 def cleanup_old_videos(s3_client, current_key):
@@ -215,6 +237,9 @@ def process_video_async(job_id: str, data: dict):
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
         jobs[job_id]['webhook_url'] = webhook_url  # Salva per status check
 
+        # 🔥 ROW NUMBER dal job n8n/Sheets MASTER
+        row_number = int(data.get('row_number') or data.get('RowID') or 1)  # 🔥 AGGIUNTO
+
         audiobase64 = data.get("audio_base64") or data.get("audiobase64")
         raw_script = data.get("script") or data.get("script_chunk") or data.get("script_audio") or data.get("script_completo") or ""
         script = " ".join(str(p).strip() for p in raw_script) if isinstance(raw_script, list) else str(raw_script).strip()
@@ -243,7 +268,7 @@ def process_video_async(job_id: str, data: dict):
         probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audiopath], stdout=subprocess.PIPE, text=True, timeout=10)
         real_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 720.0
 
-        print(f"⏱️  [{job_id}] Durata: {real_duration/60:.1f}min", flush=True)
+        print(f"⏱️  [{job_id}] Durata: {real_duration/60:.1f}min | Riga: {row_number}", flush=True)
 
         # Scene sync
         script_words = script.lower().split()
@@ -338,6 +363,9 @@ def process_video_async(job_id: str, data: dict):
         public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
         cleanup_old_videos(s3_client, object_key)
 
+        # 🔥 SALVA URL IN SHEETS COLONNA M (PRIMA del webhook!)
+        update_sheets_video_url(public_url, row_number)
+
         # Cleanup
         for path in [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]:
             try:
@@ -352,14 +380,16 @@ def process_video_async(job_id: str, data: dict):
         jobs[job_id]['video_url'] = public_url
         jobs[job_id]['duration'] = real_duration
         jobs[job_id]['clips_used'] = len(scene_paths)
+        jobs[job_id]['row_number'] = row_number  # 🔥 AGGIUNTO
 
-        # 🔥 WEBHOOK CALLBACK al webhook n8n specifico!
+        # 🔥 WEBHOOK CALLBACK al webhook n8n specifico! (fallback)
         if webhook_url:
             try:
                 callback_payload = {
                     'job_id': job_id,
                     'status': 'completed',
                     'video_url': public_url,
+                    'row_number': row_number,  # 🔥 AGGIUNTO
                     'duration': real_duration,
                     'clips_used': len(scene_paths),
                     'original_data': data
@@ -421,7 +451,7 @@ def generate():
         thread.daemon = True
         thread.start()
 
-        print(f"🚀 [{job_id}] Job created! Webhook: {webhook_url}", flush=True)
+        print(f"🚀 [{job_id}] Job created! Webhook: {webhook_url} | Riga: {data.get('row_number')}", flush=True)
 
         # Risposta IMMEDIATA (< 1 secondo!)
         return jsonify({
@@ -455,6 +485,7 @@ def get_status(job_id):
         response['video_url'] = job.get('video_url')
         response['duration'] = job.get('duration')
         response['clips_used'] = job.get('clips_used')
+        response['row_number'] = job.get('row_number')  # 🔥 AGGIUNTO
     elif job['status'] == 'failed':
         response['error'] = job.get('error')
 
