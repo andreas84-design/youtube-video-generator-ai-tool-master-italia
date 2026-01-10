@@ -451,17 +451,18 @@ def process_video_async(job_id, data):
         cleanup_old_videos(s3_client, object_key)
         
         # 🔧 Sheets update BULLETPROOF
+        # DOPO R2 upload, sostituisci blocco Sheets:
         gc = get_gspread_client()
         print(f"🔍 DEBUG gspread client: {'OK' if gc else 'FAILED'}", flush=True)
         if gc and row_number > 0:
             try:
-                sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-                sheet.update_cell(row_number, 13, public_url)
-                print(f"📊 ✅ Google Sheet row {row_number} col M(13) UPDATED: {public_url}", flush=True)
+        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+        sheet.update_cell(row_number, 13, public_url)      # Col M: URL
+        sheet.update_cell(row_number, 2, "PRODOTTO")       # ← GENIALATA Col B!
+        print(f"📊 ✅ Sheet row {row_number}: M={public_url[:60]} + B=PRODOTTO (anti-loop)", flush=True)
             except Exception as e:
-                print(f"❌ Google Sheet update fallito row {row_number}: {str(e)}", flush=True)
-        else:
-            print(f"⚠️ Sheets SKIP: gc={'NO' if not gc else 'OK'} | row={row_number}", flush=True)
+        print(f"❌ Sheets fallito row {row_number}: {str(e)}", flush=True)
+
         
         # Cleanup
         paths_to_cleanup = [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]
