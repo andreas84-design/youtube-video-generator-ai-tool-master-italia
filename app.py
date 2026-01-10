@@ -8,6 +8,7 @@ import datetime as dt
 import requests
 from flask import Flask, request, jsonify
 import boto3
+from botocore.config import Config
 import math
 import random
 from threading import Thread
@@ -20,372 +21,505 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Config R2 (S3 compatibile)
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
-R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
+R2_REGION = os.environ.get("R2_REGION", "auto")
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 
-PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
-PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
-N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
-
+# Pexels / Pixabay API
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
+PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
-# ✅ ID FISSO PER QUESTO CANALE (CAMBIA SOLO QUESTA RIGA PER GLI ALTRI CANALI)
+# ✅ ID FISSO AI TOOL MASTER ITALIA
 SPREADSHEET_ID = "1hNABNms2MdhcjY4XJK86U4e142MaCZMDIrSx5JVftqo"
 
 jobs = {}
 MAX_JOBS = 50
 
 def get_gspread_client():
+    """Client Google Sheets per update Video_URL"""
     try:
         if not GOOGLE_CREDENTIALS_JSON:
-            raise RuntimeError("GOOGLE_CREDENTIALS_JSON mancante")
+            return None
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(credentials)
     except Exception as e:
-        logger.error(f"Gspread client fail: {e}")
+        logger.error(f"Google Sheets client error: {e}")
         return None
 
 def get_s3_client():
-    try:
-        if not R2_ACCOUNT_ID:
-            raise RuntimeError("R2_ACCOUNT_ID mancante")
+    """Client S3 configurato per Cloudflare R2"""
+    if R2_ACCOUNT_ID:
         endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-        
-        return boto3.client(
-            's3',
-            endpoint_url=endpoint_url,
-            aws_access_key_id=R2_ACCESS_KEY_ID,
-            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            region_name='auto'
-        )
-    except Exception as e:
-        logger.error(f"R2 client fail: {e}")
-        raise
-
-def cleanup_jobs():
-    global jobs
-    if len(jobs) > MAX_JOBS:
-        old_keys = sorted(jobs.keys(), key=lambda k: jobs[k].get('created_at', ''))[:len(jobs)-MAX_JOBS]
-        for k in old_keys:
-            del jobs[k]
-
-def pick_visual_query(context: str, keywords_text: str = "") -> str:
-    if isinstance(context, list):
-        context = ' '.join(str(c) for c in context)
-    ctx = (context or "").lower()
+    else:
+        endpoint_url = None
+    if endpoint_url is None:
+        raise RuntimeError("Endpoint R2 non configurato: imposta R2_ACCOUNT_ID in Railway")
     
-    if isinstance(keywords_text, list):
-        keywords_text = ' '.join(str(k) for k in keywords_text)
+    session = boto3.session.Session()
+    s3_client = session.client(
+        service_name="s3",
+        region_name=R2_REGION,
+        endpoint_url=endpoint_url,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(s3={"addressing_style": "virtual"}),
+    )
+    return s3_client
+
+def cleanup_old_videos(s3_client, current_key):
+    """Cancella tutti i video MP4 in R2 TRANNE quello appena caricato"""
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="videos/")
+        deleted_count = 0
+        for page in pages:
+            if "Contents" not in page:
+                continue
+            for obj in page["Contents"]:
+                key = obj["Key"]
+                if key.endswith(".mp4") and key != current_key:
+                    s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                    deleted_count += 1
+                    print(f"🗑️ Cancellato vecchio video: {key}", flush=True)
+        if deleted_count > 0:
+            print(f"✅ Rotazione completata: {deleted_count} video vecchi rimossi", flush=True)
+        else:
+            print("✅ Nessun video vecchio da rimuovere", flush=True)
+    except Exception as e:
+        print(f"⚠️ Errore rotazione R2 (video vecchi restano): {str(e)}", flush=True)
+
+# -------------------------------------------------
+# Mapping SCENA → QUERY visiva (canale AI TOOL MASTER ITALIA)
+# -------------------------------------------------
+def pick_visual_query(context: str, keywords_text: str = "") -> str:
+    """Query ottimizzate per B-roll AI/TECH: laptop, coding, AI, workflow, productivity, developer life."""
+    ctx = (context or "").lower()
     kw = (keywords_text or "").lower()
     
-    base = "ai workstation laptop coding workflow office technology screens"
+    base = "ai tool technology laptop coding workflow productivity developer"
     
-    queries = {
-        "produttivit": "person laptop automation workflow modern office productivity",
-        "prompt": "computer screen chat interface prompt dark background",
-        "n8n": "monitor flowchart automation nodes glowing lines",
-        "excel": "spreadsheet laptop charts tables clean desk",
-        "tastiera": "desk laptop ergonomic keyboard mouse",
-        "libro": "book laptop ai interface notes"
-    }
+    # AI / Intelligenza Artificiale
+    if any(w in ctx for w in ["ai", "intelligenza", "artificial", "machine learning", "ml"]):
+        return "ai artificial intelligence technology futuristic, machine learning data visualization, neural network ai tool"
     
-    for key, q in queries.items():
-        if key in ctx:
-            return q
+    # Coding / Programmazione / Sviluppo
+    if any(w in ctx for w in ["cod", "programm", "svilupp", "debug", "code", "python", "javascript"]):
+        return "programmer coding laptop computer, software developer typing code, programming workflow productivity"
     
-    return f"{kw} laptop computer coding office" if kw else base
+    # Workflow / Automazione / Processi
+    if any(w in ctx for w in ["workflow", "automaz", "process", "flusso", "n8n", "zapier"]):
+        return "automation workflow productivity tools, business process optimization, workflow management software"
+    
+    # Productivity / Produttività / Tool
+    if any(w in ctx for w in ["produttività", "tool", "strument", "efficienza", "task"]):
+        return "productivity tools laptop work, time management productivity app, efficient workflow digital tools"
+    
+    # Data / Analytics / Grafici
+    if any(w in ctx for w in ["data", "analisi", "grafic", "chart", "dashboard"]):
+        return "data analytics dashboard visualization, business intelligence charts graphs, data science analysis tools"
+    
+    # API / Integrazione / Cloud
+    if any(w in ctx for w in ["api", "integrazion", "cloud", "server", "database"]):
+        return "api integration developer tools, cloud computing server infrastructure, database management software"
+    
+    # Se abbiamo keywords specifiche dallo Sheet
+    if kw and kw != "none":
+        return f"{kw}, ai tool technology, laptop coding workflow, developer productivity, software engineering"
+    
+    # Fallback AI/TECH generico
+    return base
 
-def fetch_clip_for_scene(scene_number: int, query: str, avg_duration: float):
-    target_duration = min(4.0, avg_duration)
+def is_ai_tool_video_metadata(video_data, source):
+    """Filtro anti-content inappropriato per AI/TECH: no animali, cucina, sport, natura generica."""
+    banned = [
+        "dog", "cat", "animal", "wildlife", "bird", "fish", "horse",
+        "fitness", "gym", "workout", "yoga",
+        "kitchen", "cooking", "food", "recipe",
+        "wedding", "party", "celebration",
+        "sports", "game", "soccer", "football",
+        "nature", "landscape", "mountain", "beach", "forest", "ocean"
+    ]
     
-    def download_file(url: str):
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        try:
-            resp = requests.get(url, stream=True, timeout=30)
-            resp.raise_for_status()
-            for chunk in resp.iter_iter_content(1024*1024):
-                if chunk:
-                    tmp.write(chunk)
-            tmp.close()
-            return tmp.name
-        except:
-            try:
-                os.unlink(tmp.name)
-            except:
-                pass
+    # Keywords AI/TECH che vogliamo
+    tech_keywords = [
+        "laptop", "computer", "screen", "keyboard", "coding", "code", "programming",
+        "ai", "artificial", "intelligence", "neural", "machine", "learning",
+        "data", "chart", "graph", "dashboard", "analytics",
+        "developer", "programmer", "software", "engineer",
+        "technology", "tech", "digital", "workflow", "productivity",
+        "office", "work", "business", "professional", "meeting"
+    ]
+    
+    if source == "pexels":
+        text = (video_data.get("description", "") + " " + " ".join(video_data.get("tags", []))).lower()
+    else:
+        text = " ".join(video_data.get("tags", [])).lower()
+    
+    has_banned = any(kw in text for kw in banned)
+    has_tech = any(kw in text for kw in tech_keywords)
+    
+    status = "✅ AI-TECH OK" if (not has_banned and has_tech) else ("❌ OFF-TOPIC" if has_banned else "⚠️ NEUTRAL")
+    print(f"🔍 [{source}] '{text[:60]}...' → {status}", flush=True)
+    
+    # Accetta se: (1) ha keywords tech E non banned, OPPURE (2) non ha banned (neutrale OK)
+    return not has_banned
+
+def download_file(url: str) -> str:
+    """Download video con chunk grandi per velocità"""
+    tmp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    clip_resp = requests.get(url, stream=True, timeout=30)
+    clip_resp.raise_for_status()
+    for chunk in clip_resp.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            tmp_clip.write(chunk)
+    tmp_clip.close()
+    return tmp_clip.name
+
+def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: float):
+    """🎯 Canale AI TOOL: B-roll tech, laptop, coding, AI demo, workflow. Filtro anti-natura/sport."""
+    target_duration = min(4.0, avg_scene_duration)
+    
+    def try_pexels():
+        if not PEXELS_API_KEY:
             return None
-    
-    if PEXELS_API_KEY:
-        try:
-            resp = requests.get(
-                "https://api.pexels.com/videos/search", 
-                headers={"Authorization": PEXELS_API_KEY},
-                params={"query": query, "orientation": "landscape", "per_page": 15, "page": random.randint(1,3)},
-                timeout=20
-            )
-            if resp.status_code == 200:
-                videos = resp.json().get("videos", [])
-                if videos:
-                    vf = random.choice(videos)["video_files"][0]
-                    path = download_file(vf["link"])
-                    if path:
-                        return path, target_duration
-        except:
-            pass
-    
-    if PIXABAY_API_KEY:
-        try:
-            resp = requests.get(
-                "https://pixabay.com/api/videos/", 
-                params={"key": PIXABAY_API_KEY, "q": query, "per_page": 15},
-                timeout=20
-            )
-            if resp.status_code == 200:
-                for hit in resp.json().get("hits", []):
-                    url = hit["videos"].get("medium", {}).get("url")
-                    if url:
-                        path = download_file(url)
-                        if path:
-                            return path, target_duration
-        except:
-            pass
-    
-    return None, None
-
-def process_video_async(job_id: str, data: dict):
-    audiopath = video_looped = final_video = None
-    scene_paths = []
-    
-    try:
-        logger.info(f"[{job_id}] START Row:{data.get('row_number','N/A')}")
-        cleanup_jobs()
-        
-        webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        
-        # ✅ FIX row_number robusto
-        try:
-            row_number_raw = data.get('row_number', 1)
-            if isinstance(row_number_raw, dict):
-                row_number = int(row_number_raw.get('row', 1))
-            elif isinstance(row_number_raw, str):
-                row_number = int(row_number_raw)
-            else:
-                row_number = int(row_number_raw)
-        except (ValueError, TypeError):
-            row_number = 1
-            logger.warning(f"[{job_id}] row_number invalid, using 1")
-        
-        jobs[job_id] = {
-            'status': 'processing',
-            'created_at': dt.datetime.utcnow().isoformat(),
-            'webhook_url': webhook_url,
-            'row_number': row_number
+        headers = {"Authorization": PEXELS_API_KEY}
+        params = {
+            "query": f"{query} laptop coding ai tool technology workflow",
+            "orientation": "landscape",
+            "per_page": 25,
+            "page": random.randint(1, 3),
         }
-        
-        audio_b64 = data.get('audio_base64') or data.get('audiobase64')
-        if not audio_b64:
-            logger.error(f"[{job_id}] MISSING AUDIO - keys: {list(data.keys())}")
-            raise ValueError("No audio_base64 or audiobase64 in request")
-        
-        logger.info(f"[{job_id}] Audio len: {len(audio_b64)}")
-        
-        audio_bytes = base64.b64decode(audio_b64)
-        audiopath = tempfile.mktemp(suffix='.mp3')
-        with open(audiopath, 'wb') as f:
-            f.write(audio_bytes)
-        
-        audio_wav = tempfile.mktemp(suffix='.wav')
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", audiopath, "-acodec", "pcm_s16le", "-ar", "48000", audio_wav], 
-            timeout=120, check=True, capture_output=True
-        )
-        os.unlink(audiopath)
-        audiopath = audio_wav
-        
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audiopath], 
-            stdout=subprocess.PIPE, text=True, timeout=10
-        )
-        duration = float(probe.stdout.strip() or 600)
-        
-        logger.info(f"[{job_id}] Duration: {duration/60:.1f}min")
-        
-        script_raw = data.get("script_chunk") or data.get("script") or ""
-        if isinstance(script_raw, list):
-            script_raw = ' '.join(str(s) for s in script_raw)
-        logger.info(f"[{job_id}] script_raw type: {type(script_raw)}, len: {len(script_raw)}")
-        script = script_raw.lower().split()
-        
-        keywords = data.get("keywords", "")
-        avg_dur = duration / 25
-        
-        for i in range(30):
-            word_idx = int((i * avg_dur) * (len(script) / duration)) if script else 0
-            context = " ".join(script[word_idx:word_idx+5]) if word_idx < len(script) else ""
-            query = pick_visual_query(context, keywords)
-            
-            path, _ = fetch_clip_for_scene(i+1, query, avg_dur)
+        resp = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=20)
+        if resp.status_code != 200:
+            return None
+        videos = resp.json().get("videos", [])
+        tech_videos = [v for v in videos if is_ai_tool_video_metadata(v, "pexels")]
+        print(f"🎯 Pexels: {len(videos)} totali → {len(tech_videos)} AI-TECH OK", flush=True)
+        if tech_videos:
+            video = random.choice(tech_videos)
+            for vf in video.get("video_files", []):
+                if vf.get("width", 0) >= 1280:
+                    return download_file(vf["link"])
+        return None
+    
+    def try_pixabay():
+        if not PIXABAY_API_KEY:
+            return None
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": f"{query} laptop coding ai tool technology workflow",
+            "per_page": 25,
+            "safesearch": "true",
+            "min_width": 1280,
+        }
+        resp = requests.get("https://pixabay.com/api/videos/", params=params, timeout=20)
+        if resp.status_code != 200:
+            return None
+        hits = resp.json().get("hits", [])
+        for hit in hits:
+            if is_ai_tool_video_metadata(hit, "pixabay"):
+                videos = hit.get("videos", {})
+                for quality in ["large", "medium", "small"]:
+                    if quality in videos and "url" in videos[quality]:
+                        return download_file(videos[quality]["url"])
+        return None
+    
+    # Priorità: Pexels → Pixabay
+    for source_name, func in [("Pexels", try_pexels), ("Pixabay", try_pixabay)]:
+        try:
+            path = func()
             if path:
-                scene_paths.append(path)
-            if len(scene_paths) >= 25:
-                break
-        
-        logger.info(f"[{job_id}] Clips: {len(scene_paths)}")
-        if len(scene_paths) < 3:
-            raise RuntimeError("Clip insufficienti")
-        
-        normalized = []
-        for i, path in enumerate(scene_paths):
-            norm = tempfile.mktemp(suffix='.mp4')
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", path, 
-                     "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease," 
-                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30", 
-                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", norm], 
-                    timeout=90, check=True, capture_output=True
-                )
-                if os.path.exists(norm) and os.path.getsize(norm) > 50000:
-                    normalized.append(norm)
-            except:
-                try:
-                    os.unlink(norm)
-                except:
-                    pass
-        
-        if not normalized:
-            raise RuntimeError("Nessuna clip valida")
-        
-        concat_list = tempfile.mktemp(suffix='.txt')
-        with open(concat_list, 'w') as f:
-            loops = max(1, math.ceil(duration / (len(normalized) * 4)))
-            for _ in range(min(loops, 3)):
-                for p in normalized:
-                    f.write(f"file '{p}'\n")
-        
-        video_looped = tempfile.mktemp(suffix='.mp4')
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, 
-             "-c", "copy", "-t", str(duration), video_looped], 
-            timeout=300, check=True, capture_output=True
-        )
-        os.unlink(concat_list)
-        
-        final_video = tempfile.mktemp(suffix='.mp4')
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", video_looped, "-i", audiopath, 
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", 
-             "-c:a", "aac", "-shortest", final_video], 
-            timeout=300, check=True, capture_output=True
-        )
-        
-        s3 = get_s3_client()
-        key = f"videos/{dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}_{job_id}.mp4"
-        s3.upload_file(final_video, R2_BUCKET_NAME, key, ExtraArgs={'ContentType': 'video/mp4'})
-        video_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
-        
-        for path in [audiopath, video_looped, final_video] + normalized + scene_paths:
-            try:
-                os.unlink(path)
-            except:
-                pass
-        
-        jobs[job_id].update({
-            'status': 'completed',
-            'video_url': video_url,
-            'duration': duration,
-            'clips_used': len(scene_paths)
-        })
-        logger.info(f"[{job_id}] SUCCESS: {video_url}")
-        
-        # ✅ UPDATE COLONNA M con ID FISSO
-        if row_number > 0 and SPREADSHEET_ID:
-            try:
-                gc = get_gspread_client()
-                if gc:
-                    sh = gc.open_by_key(SPREADSHEET_ID)
-                    ws = sh.sheet1
-                    # Colonna M = 13
-                    ws.update_cell(row_number, 13, video_url)  # update_cell(row, col, value)[web:25][web:24]
-                    logger.info(f"[{job_id}] Sheets updated row {row_number} col M")
-            except Exception as e:
-                logger.error(f"[{job_id}] Sheets update FAIL: {e}")
-        
-        if webhook_url:
-            try:
-                requests.post(
-                    webhook_url,
-                    json={
-                        'jobid': job_id,
-                        'status': 'completed',
-                        'videourl': video_url,
-                        'duration': duration,
-                        'clipsused': len(scene_paths),
-                        'row_number': row_number
-                    },
-                    timeout=10
-                )
-            except:
-                pass
-            
-    except Exception as e:
-        logger.error(f"[{job_id}] FAIL: {str(e)}")
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = str(e)
-        
-        if 'webhook_url' in jobs[job_id] and jobs[job_id]['webhook_url']:
-            try:
-                requests.post(
-                    jobs[job_id]['webhook_url'], 
-                    json={'jobid': job_id, 'status': 'failed', 'error': str(e)}, 
-                    timeout=10
-                )
-            except:
-                pass
-        
-        for path in [audiopath, video_looped, final_video] + scene_paths:
-            try:
-                if path:
-                    os.unlink(path)
-            except:
-                pass
-
-@app.route("/generate", methods=["POST"])
-def generate():
-    data = request.get_json() or {}
-    job_id = str(uuid.uuid4())
+                print(f"🎥 Scena {scene_number}: '{query[:40]}...' → {source_name} ✓", flush=True)
+                return path, target_duration
+        except Exception as e:
+            print(f"⚠️ {source_name}: {e}", flush=True)
     
-    logger.info(f"POST /generate keys: {list(data.keys())}")
-    logger.info(f"audio_base64: {'YES' if data.get('audio_base64') else 'NO'} | audiobase64: {'YES' if data.get('audiobase64') else 'NO'}")
-    
-    if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
-        return jsonify({'success': False, 'error': 'R2 config mancante'}), 500
-    
-    jobs[job_id] = {'status': 'queued'}
-    Thread(target=process_video_async, args=(job_id, data), daemon=True).start()
-    
-    logger.info(f"Job queued: {job_id}")
-    return jsonify({'success': True, 'job_id': job_id, 'status': 'processing'}), 202
-
-@app.route("/status/<job_id>", methods=["GET"])
-def status(job_id):
-    job = jobs.get(job_id, {'status': 'not_found'})
-    resp = {'jobid': job_id, 'status': job['status']}
-    if job['status'] == 'completed':
-        resp.update({k: job.get(k) for k in ['video_url', 'duration', 'clips_used', 'row_number']})
-    elif job['status'] == 'failed':
-        resp['error'] = job.get('error')
-    return jsonify(resp)
+    print(f"⚠️ NO CLIP per scena {scene_number}: '{query}'", flush=True)
+    return None, None
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({'status': 'ok', 'jobs': len(jobs)})
+    return jsonify({"status": "healthy", "jobs": len(jobs)})
+
+@app.route("/ffmpeg-test", methods=["GET"])
+def ffmpeg_test():
+    result = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    firstline = result.stdout.splitlines()[0] if result.stdout else "no output"
+    return jsonify({"ffmpeg_output": firstline})
+
+@app.route("/status/<job_id>", methods=["GET"])
+def get_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job.get("created_at")
+    }
+    if job['status'] == 'completed':
+        response['video_url'] = job.get('video_url')
+        response['duration'] = job.get('duration')
+        response['clips_used'] = job.get('clips_used')
+    elif job['status'] == 'failed':
+        response['error'] = job.get('error')
+    
+    return jsonify(response)
+
+def process_video_async(job_id, data):
+    """Processa video in background thread"""
+    job = jobs[job_id]
+    job["status"] = "processing"
+    
+    audiopath = None
+    audio_wav_path = None
+    video_looped_path = None
+    final_video_path = None
+    scene_paths = []
+    
+    try:
+        if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_BASE_URL]):
+            raise RuntimeError("Config R2 mancante")
+        
+        audiobase64 = data.get("audio_base64") or data.get("audiobase64")
+        raw_script = (data.get("script") or data.get("script_chunk") or data.get("script_audio") or data.get("script_completo") or "")
+        script = (" ".join(str(p).strip() for p in raw_script) if isinstance(raw_script, list) else str(raw_script).strip())
+        raw_keywords = data.get("keywords", "")
+        sheet_keywords = (", ".join(str(k).strip() for k in raw_keywords) if isinstance(raw_keywords, list) else str(raw_keywords).strip())
+        row_number = data.get("row_number", 1)  # Da n8n {"row":9}
+        
+        print("=" * 80, flush=True)
+        print(f"🎬 START AI TOOL MASTER: {len(script)} char script, keywords: '{sheet_keywords}', row: {row_number}", flush=True)
+        
+        if not audiobase64:
+            raise RuntimeError("audiobase64 mancante")
+        
+        # Audio processing
+        audio_bytes = base64.b64decode(audiobase64)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            f.write(audio_bytes)
+        audiopath_tmp = f.name
+        
+        audio_wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        audio_wav_path = audio_wav_tmp.name
+        audio_wav_tmp.close()
+        
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error", "-i", audiopath_tmp,
+            "-acodec", "pcm_s16le", "-ar", "48000", audio_wav_path
+        ], timeout=60, check=True)
+        os.unlink(audiopath_tmp)
+        audiopath = audio_wav_path
+        
+        # Real duration
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", audiopath
+        ], stdout=subprocess.PIPE, text=True, timeout=10)
+        real_duration = float(probe.stdout.strip() or 720.0)
+        print(f"⏱️ Durata audio: {real_duration/60:.1f}min ({real_duration:.0f}s)", flush=True)
+        
+        # Scene sync
+        script_words = script.lower().split()
+        words_per_second = (len(script_words) / real_duration if real_duration > 0 else 2.5)
+        avg_scene_duration = real_duration / 25
+        scene_assignments = []
+        
+        for i in range(25):
+            timestamp = i * avg_scene_duration
+            word_index = int(timestamp * words_per_second)
+            scene_context = " ".join(script_words[word_index: word_index + 7]) if word_index < len(script_words) else "ai tool technology laptop coding workflow"
+            scene_query = pick_visual_query(scene_context, sheet_keywords)
+            scene_assignments.append({
+                "scene": i + 1, "timestamp": round(timestamp, 1),
+                "context": scene_context[:60], "query": scene_query[:80]
+            })
+        
+        # Download clips
+        for assignment in scene_assignments:
+            print(f"📍 Scene {assignment['scene']}: {assignment['timestamp']}s → '{assignment['context']}'", flush=True)
+            clip_path, clip_dur = fetch_clip_for_scene(
+                assignment["scene"], assignment["query"], avg_scene_duration
+            )
+            if clip_path and clip_dur:
+                scene_paths.append((clip_path, clip_dur))
+        
+        print(f"✅ CLIPS SCARICATE: {len(scene_paths)}/25", flush=True)
+        if len(scene_paths) < 5:
+            raise RuntimeError(f"Troppe poche clip: {len(scene_paths)}/25")
+        
+        # Normalize clips
+        normalized_clips = []
+        for i, (clip_path, _dur) in enumerate(scene_paths):
+            try:
+                normalized_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                normalized_path = normalized_tmp.name
+                normalized_tmp.close()
+                subprocess.run([
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", clip_path,
+                    "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an", normalized_path
+                ], timeout=120, check=True)
+                if os.path.exists(normalized_path) and os.path.getsize(normalized_path) > 1000:
+                    normalized_clips.append(normalized_path)
+            except Exception:
+                pass
+        
+        if not normalized_clips:
+            raise RuntimeError("Nessuna clip normalizzata")
+        
+        # Concat
+        def get_duration(p):
+            out = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", p
+            ], stdout=subprocess.PIPE, text=True, timeout=10).stdout.strip()
+            return float(out or 4.0)
+        
+        total_clips_duration = sum(get_duration(p) for p in normalized_clips)
+        concat_list_tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
+        entries_written = 0
+        MAX_CONCAT_ENTRIES = 150
+        
+        if total_clips_duration < real_duration and len(normalized_clips) > 1:
+            loops_needed = math.ceil(real_duration / total_clips_duration)
+            for _ in range(loops_needed):
+                for norm_path in normalized_clips:
+                    if entries_written >= MAX_CONCAT_ENTRIES:
+                        break
+                    concat_list_tmp.write(f"file '{norm_path}'\n")
+                    entries_written += 1
+                if entries_written >= MAX_CONCAT_ENTRIES:
+                    break
+        else:
+            for norm_path in normalized_clips:
+                concat_list_tmp.write(f"file '{norm_path}'\n")
+                entries_written += 1
+        
+        concat_list_tmp.close()
+        
+        video_looped_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        video_looped_path = video_looped_tmp.name
+        video_looped_tmp.close()
+        
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", concat_list_tmp.name,
+            "-vf", "fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-t", str(real_duration), video_looped_path
+        ], timeout=600, check=True)
+        os.unlink(concat_list_tmp.name)
+        
+        # Final merge
+        final_video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        final_video_path = final_video_tmp.name
+        final_video_tmp.close()
+        
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", video_looped_path, "-i", audiopath,
+            "-filter_complex", "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p[v]",
+            "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k", "-shortest", final_video_path
+        ], timeout=600, check=True)
+        
+        # R2 upload
+        s3_client = get_s3_client()
+        today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+        object_key = f"videos/{today}/{uuid.uuid4().hex}.mp4"
+        s3_client.upload_file(
+            Filename=final_video_path,
+            Bucket=R2_BUCKET_NAME,
+            Key=object_key,
+            ExtraArgs={"ContentType": "video/mp4"}
+        )
+        public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
+        cleanup_old_videos(s3_client, object_key)
+        
+        # ✅ UPDATE GOOGLE SHEET colonna M (13) con Video_URL
+        gc = get_gspread_client()
+        if gc and row_number > 0:
+            try:
+                sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+                sheet.update_cell(row_number, 13, public_url)
+                print(f"📊 Google Sheet row {row_number} col M(13) UPDATED: {public_url}", flush=True)
+            except Exception as e:
+                print(f"⚠️ Google Sheet update failed: {e}", flush=True)
+        
+        # Cleanup
+        paths_to_cleanup = [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]
+        for path in paths_to_cleanup:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        
+        print(f"✅ VIDEO AI TOOL MASTER COMPLETO: {real_duration/60:.1f}min → {public_url}", flush=True)
+        
+        job.update({
+            "status": "completed",
+            "video_url": public_url,
+            "duration": real_duration,
+            "clips_used": len(scene_paths),
+            "row_number": row_number
+        })
+        
+    except Exception as e:
+        print(f"❌ ERRORE PROCESSING: {e}", flush=True)
+        job.update({"status": "failed", "error": str(e)})
+    
+    finally:
+        # Cleanup job dopo 1h
+        Thread(target=lambda: cleanup_job_delayed(job_id), daemon=True).start()
+
+def cleanup_job_delayed(job_id, delay=3600):
+    """Cancella job dopo delay secondi"""
+    import time
+    time.sleep(delay)
+    if job_id in jobs:
+        del jobs[job_id]
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    """Endpoint principale: crea job async"""
+    try:
+        data = request.get_json(force=True) or {}
+        job_id = str(uuid.uuid4())
+        
+        jobs[job_id] = {
+            "status": "queued",
+            "created_at": dt.datetime.utcnow().isoformat(),
+            "data": data
+        }
+        
+        # Pulizia jobs vecchi
+        if len(jobs) > MAX_JOBS:
+            old_jobs = sorted(jobs.keys(), key=lambda k: jobs[k]["created_at"])[:len(jobs)-MAX_JOBS]
+            for oj in old_jobs:
+                del jobs[oj]
+        
+        # Avvia processing async
+        Thread(target=process_video_async, args=(job_id, data), daemon=True).start()
+        
+        print(f"🚀 Job {job_id} QUEUED: row {data.get('row_number', 'N/A')}", flush=True)
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Video generation started (check /status/<job_id>)"
+        })
+    
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, threaded=True)
