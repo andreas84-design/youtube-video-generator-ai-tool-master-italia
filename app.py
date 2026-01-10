@@ -174,10 +174,10 @@ def process_video_async(job_id: str, data: dict):
         
         # Scene fetch (max 20)
         script_raw = data.get("script_chunk") or data.get("script") or ""
-if isinstance(script_raw, list):
-    script_raw = ' '.join(str(s) for s in script_raw)
-logger.info(f"[{job_id}] script_raw type: {type(script_raw)}, len: {len(script_raw)}")
-script = script_raw.lower().split()
+        if isinstance(script_raw, list):
+            script_raw = ' '.join(str(s) for s in script_raw)
+        logger.info(f"[{job_id}] script_raw type: {type(script_raw)}, len: {len(script_raw)}")
+        script = script_raw.lower().split()
 
         keywords = data.get("keywords", "")
         avg_dur = duration / 20
