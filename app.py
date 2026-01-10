@@ -8,11 +8,12 @@ import datetime as dt
 import requests
 from flask import Flask, request, jsonify
 import boto3
-from botocore.config import Config
 import math
 import random
 from threading import Thread
 import logging
+import gspread
+from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,14 +25,28 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
-R2_REGION = os.environ.get("R2_REGION", "auto")
 
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+
 jobs = {}
 MAX_JOBS = 50
+
+def get_gspread_client():
+    try:
+        if not GOOGLE_CREDENTIALS_JSON:
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON mancante")
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+    except Exception as e:
+        logger.error(f"Gspread client fail: {e}")
+        return None
 
 def get_s3_client():
     try:
@@ -138,7 +153,7 @@ def process_video_async(job_id: str, data: dict):
         cleanup_jobs()
         
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        row_number = int(data.get('row_number') or 1)
+        row_number = int(data.get('row_number') or 0)
         
         jobs[job_id] = {
             'status': 'processing',
@@ -147,7 +162,6 @@ def process_video_async(job_id: str, data: dict):
             'row_number': row_number
         }
         
-        # 🔥 FIX: gestisci audio_base64 O audiobase64
         audio_b64 = data.get('audio_base64') or data.get('audiobase64')
         if not audio_b64:
             logger.error(f"[{job_id}] MISSING AUDIO - keys: {list(data.keys())}")
@@ -155,20 +169,17 @@ def process_video_async(job_id: str, data: dict):
         
         logger.info(f"[{job_id}] Audio len: {len(audio_b64)}")
         
-        # Decode audio
         audio_bytes = base64.b64decode(audio_b64)
         audiopath = tempfile.mktemp(suffix='.mp3')
         with open(audiopath, 'wb') as f:
             f.write(audio_bytes)
         
-        # Convert to WAV
         audio_wav = tempfile.mktemp(suffix='.wav')
         subprocess.run(["ffmpeg", "-y", "-i", audiopath, "-acodec", "pcm_s16le", "-ar", "48000", audio_wav], 
                       timeout=120, check=True, capture_output=True)
         os.unlink(audiopath)
         audiopath = audio_wav
         
-        # Duration
         probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", 
                                "-of", "csv=p=0", audiopath], 
                               stdout=subprocess.PIPE, text=True, timeout=10)
@@ -176,17 +187,17 @@ def process_video_async(job_id: str, data: dict):
         
         logger.info(f"[{job_id}] Duration: {duration/60:.1f}min")
         
-        # Scene fetch (max 20)
         script_raw = data.get("script_chunk") or data.get("script") or ""
         if isinstance(script_raw, list):
             script_raw = ' '.join(str(s) for s in script_raw)
         logger.info(f"[{job_id}] script_raw type: {type(script_raw)}, len: {len(script_raw)}")
         script = script_raw.lower().split()
-
-        keywords = data.get("keywords", "")
-        avg_dur = duration / 20
         
-        for i in range(20):
+        keywords = data.get("keywords", "")
+        avg_dur = duration / 25
+        
+        # 🔥 FIX: 25 clips invece di 15
+        for i in range(30):
             word_idx = int((i * avg_dur) * (len(script) / duration)) if script else 0
             context = " ".join(script[word_idx:word_idx+5]) if word_idx < len(script) else ""
             query = pick_visual_query(context, keywords)
@@ -194,13 +205,12 @@ def process_video_async(job_id: str, data: dict):
             path, _ = fetch_clip_for_scene(i+1, query, avg_dur)
             if path:
                 scene_paths.append(path)
-            if len(scene_paths) >= 15: break
+            if len(scene_paths) >= 25: break
         
         logger.info(f"[{job_id}] Clips: {len(scene_paths)}")
         if len(scene_paths) < 3:
             raise RuntimeError("Clip insufficienti")
         
-        # Normalize
         normalized = []
         for i, path in enumerate(scene_paths):
             norm = tempfile.mktemp(suffix='.mp4')
@@ -218,7 +228,6 @@ def process_video_async(job_id: str, data: dict):
         if not normalized:
             raise RuntimeError("Nessuna clip valida")
         
-        # Concat
         concat_list = tempfile.mktemp(suffix='.txt')
         with open(concat_list, 'w') as f:
             loops = max(1, math.ceil(duration / (len(normalized) * 4)))
@@ -232,20 +241,17 @@ def process_video_async(job_id: str, data: dict):
                      timeout=300, check=True, capture_output=True)
         os.unlink(concat_list)
         
-        # Merge
         final_video = tempfile.mktemp(suffix='.mp4')
         subprocess.run(["ffmpeg", "-y", "-i", video_looped, "-i", audiopath, 
                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", 
                       "-c:a", "aac", "-shortest", final_video], 
                      timeout=300, check=True, capture_output=True)
         
-        # Upload R2
         s3 = get_s3_client()
         key = f"videos/{dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}_{job_id}.mp4"
         s3.upload_file(final_video, R2_BUCKET_NAME, key, ExtraArgs={'ContentType': 'video/mp4'})
         video_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
         
-        # Cleanup
         for path in [audiopath, video_looped, final_video] + normalized + scene_paths:
             try: os.unlink(path)
             except: pass
@@ -258,6 +264,18 @@ def process_video_async(job_id: str, data: dict):
         })
         logger.info(f"[{job_id}] SUCCESS: {video_url}")
         
+        # 🔥 UPDATE SHEETS colonna M (Video_URL)
+        if row_number > 0 and SPREADSHEET_ID:
+            try:
+                gc = get_gspread_client()
+                if gc:
+                    sh = gc.open_by_key(SPREADSHEET_ID)
+                    ws = sh.sheet1
+                    ws.update_cell(row_number, 13, video_url)  # Colonna M = 13
+                    logger.info(f"[{job_id}] Sheets updated row {row_number} col M")
+            except Exception as e:
+                logger.error(f"[{job_id}] Sheets update FAIL: {e}")
+        
         if webhook_url:
             try:
                 requests.post(webhook_url, json={
@@ -266,8 +284,7 @@ def process_video_async(job_id: str, data: dict):
                     'videourl': video_url,
                     'duration': duration,
                     'clipsused': len(scene_paths),
-                    'row_number': row_number,
-                    'originaldata': data
+                    'row_number': row_number
                 }, timeout=10)
             except: pass
             
@@ -293,7 +310,6 @@ def generate():
     data = request.get_json() or {}
     job_id = str(uuid.uuid4())
     
-    # 🔥 DEBUG
     logger.info(f"POST /generate keys: {list(data.keys())}")
     logger.info(f"audio_base64: {'YES' if data.get('audio_base64') else 'NO'} | audiobase64: {'YES' if data.get('audiobase64') else 'NO'}")
     
