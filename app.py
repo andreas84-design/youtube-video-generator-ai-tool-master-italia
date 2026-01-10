@@ -154,7 +154,10 @@ def process_video_async(job_id: str, data: dict):
         
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
         # 🔥 FIX: row_number sicuro senza crash
-        row_number = int(data.get('row_number', 1)) if data.get('row_number') is not None else 1
+        row_number_str = data.get('row_number', '1')
+    if isinstance(row_number_str, dict):
+        row_number_str = str(row_number_str.get('row', 1))
+        row_number = int(row_number_str)
         
         jobs[job_id] = {
             'status': 'processing',
