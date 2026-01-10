@@ -137,9 +137,11 @@ def pick_visual_query(context: str, keywords_text: str = "") -> str:
     return base
 
 def is_ai_tool_video_metadata(video_data, source):
-    """🔧 FIX2: Filtro RIGIDO AI/TECH - REQUIRED keywords + banned non-tech"""
-    # REQUIRED AI/TECH keywords (min 1 obbligatorio)
-    required_tech = ["ai", "coding", "code", "data", "laptop", "computer", "developer", "programmer", "technology", "tech", "workflow"]
+    """🔧 FIX A: Filtro PERMISSIVO - NO banned (neutral OK) + keywords extra"""
+    # Keywords AI/TECH ESPANSIVE (più match)
+    tech_keywords = ["ai", "coding", "code", "data", "laptop", "computer", "developer", "programmer", 
+                     "technology", "tech", "workflow", "screen", "keyboard", "office", "work", "business", 
+                     "software", "digital", "analytics", "dashboard"]
     # BANNED non-tech
     banned = ["dog", "cat", "animal", "food", "cooking", "fitness", "gym", "sports", "nature", "beach", "mountain", "wedding"]
     
@@ -148,14 +150,20 @@ def is_ai_tool_video_metadata(video_data, source):
     else:
         text = " ".join(video_data.get("tags", [])).lower()
     
-    tech_count = sum(1 for kw in required_tech if kw in text)
+    tech_count = sum(1 for kw in tech_keywords if kw in text)
     has_banned = any(kw in text for kw in banned)
     
-    status = f"✅ TECH({tech_count})" if (tech_count >= 1 and not has_banned) else ("❌ BANNED" if has_banned else f"⚠️ NEUTRAL(tech:{tech_count})")
+    if has_banned:
+        status = "❌ BANNED"
+    elif tech_count >= 1:
+        status = f"✅ TECH({tech_count})"
+    else:
+        status = f"⚠️ NEUTRAL(tech:{tech_count})"
+    
     print(f"🔍 [{source}] '{text[:60]}...' → {status}", flush=True)
     
-    # RIGIDO: SOLO se tech_count >=1 E no banned
-    return tech_count >= 1 and not has_banned
+    # 🔧 PERMISSIVO: accetta TUTTO tranne banned (neutral OK!)
+    return not has_banned
 
 def download_file(url: str) -> str:
     """Download video con chunk grandi per velocità"""
@@ -169,7 +177,7 @@ def download_file(url: str) -> str:
     return tmp_clip.name
 
 def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: float):
-    """🎯 Canale AI TOOL: B-roll tech, laptop, coding, AI demo, workflow. Filtro anti-natura/sport."""
+    """🎯 Canale AI TOOL: B-roll tech. Fallback Pixabay se Pexels 0."""
     target_duration = min(4.0, avg_scene_duration)
     
     def try_pexels():
@@ -187,7 +195,7 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: floa
             return None
         videos = resp.json().get("videos", [])
         tech_videos = [v for v in videos if is_ai_tool_video_metadata(v, "pexels")]
-        print(f"🎯 Pexels: {len(videos)} totali → {len(tech_videos)} AI-TECH OK (tech_count filtered)", flush=True)
+        print(f"🎯 Pexels: {len(videos)} totali → {len(tech_videos)} OK (no banned)", flush=True)
         if tech_videos:
             video = random.choice(tech_videos)
             for vf in video.get("video_files", []):
@@ -281,19 +289,21 @@ def process_video_async(job_id, data):
         raw_keywords = data.get("keywords", "")
         sheet_keywords = (", ".join(str(k).strip() for k in raw_keywords) if isinstance(raw_keywords, list) else str(raw_keywords).strip())
         
-        # 🔧 FIX1: Parsing row_number robusto da n8n + DEBUG creds + try/except
-        row_number_raw = data.get("row_number", 1)
+        # 🔧 FIX B/C: Parsing row_number ULTRA-ROBUSTO (gestisce nested/oggetti strani n8n)
+        row_number_raw = data.get("row_number")
         if isinstance(row_number_raw, dict):
-            row_number = int(row_number_raw.get('row', 1))
+            row_number = int(row_number_raw.get('row', row_number_raw.get('row_number', 1)))
         elif isinstance(row_number_raw, str):
             row_number = int(row_number_raw) if row_number_raw.isdigit() else 1
+        elif isinstance(row_number_raw, (int, float)):
+            row_number = int(row_number_raw)
         else:
-            row_number = int(row_number_raw) if row_number_raw else 1
+            row_number = 1
 
         print("=" * 80, flush=True)
         print(f"🎬 START AI TOOL MASTER: {len(script)} char script, keywords: '{sheet_keywords}', row: {row_number}", flush=True)
-        print(f"🔍 DEBUG row_number: '{row_number}' (type: {type(row_number)})", flush=True)
-        print(f"🔍 DEBUG GOOGLE_CREDENTIALS_JSON: {'PRESENTE' if GOOGLE_CREDENTIALS_JSON else 'MANCANTE'}", flush=True)
+        print(f"🔍 DEBUG row_number RAW: '{row_number_raw}' → PARSED: '{row_number}'", flush=True)
+        print(f"🔍 DEBUG GOOGLE_CREDENTIALS_JSON: {'PRESENTE ({len(GOOGLE_CREDENTIALS_JSON)} char)' if GOOGLE_CREDENTIALS_JSON else 'MANCANTE'}", flush=True)
         
         if not audiobase64:
             raise RuntimeError("audiobase64 mancante")
@@ -339,7 +349,7 @@ def process_video_async(job_id, data):
                 "context": scene_context[:60], "query": scene_query[:80]
             })
         
-        # Download clips
+        # Download clips (ora dovrebbe prendere 20+ clip!)
         for assignment in scene_assignments:
             print(f"📍 Scene {assignment['scene']}: {assignment['timestamp']}s → '{assignment['context']}'", flush=True)
             clip_path, clip_dur = fetch_clip_for_scene(
@@ -440,16 +450,18 @@ def process_video_async(job_id, data):
         public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
         cleanup_old_videos(s3_client, object_key)
         
-        # 🔧 FIX1: Sheets update con try/except (già fatto sopra gc check)
+        # 🔧 Sheets update BULLETPROOF
         gc = get_gspread_client()
         print(f"🔍 DEBUG gspread client: {'OK' if gc else 'FAILED'}", flush=True)
         if gc and row_number > 0:
             try:
                 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
                 sheet.update_cell(row_number, 13, public_url)
-                print(f"📊 Google Sheet row {row_number} col M(13) UPDATED: {public_url}", flush=True)
+                print(f"📊 ✅ Google Sheet row {row_number} col M(13) UPDATED: {public_url}", flush=True)
             except Exception as e:
                 print(f"❌ Google Sheet update fallito row {row_number}: {str(e)}", flush=True)
+        else:
+            print(f"⚠️ Sheets SKIP: gc={'NO' if not gc else 'OK'} | row={row_number}", flush=True)
         
         # Cleanup
         paths_to_cleanup = [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]
@@ -459,7 +471,7 @@ def process_video_async(job_id, data):
             except Exception:
                 pass
         
-        print(f"✅ VIDEO AI TOOL MASTER COMPLETO: {real_duration/60:.1f}min → {public_url}", flush=True)
+        print(f"✅ 🎬 VIDEO AI TOOL MASTER COMPLETO: {real_duration/60:.1f}min → {public_url}", flush=True)
         
         job.update({
             "status": "completed",
@@ -506,7 +518,7 @@ def generate():
         # Avvia processing async
         Thread(target=process_video_async, args=(job_id, data), daemon=True).start()
         
-        print(f"🚀 Job {job_id} QUEUED: row {data.get('row_number', 'N/A')}", flush=True)
+        print(f"🚀 Job {job_id} QUEUED: raw_row={data.get('row_number')}", flush=True)
         return jsonify({
             "success": True,
             "job_id": job_id,
