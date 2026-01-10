@@ -456,12 +456,12 @@ def process_video_async(job_id, data):
         print(f"🔍 DEBUG gspread client: {'OK' if gc else 'FAILED'}", flush=True)
         if gc and row_number > 0:
             try:
-        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-        sheet.update_cell(row_number, 13, public_url)      # Col M: URL
-        sheet.update_cell(row_number, 2, "PRODOTTO")       # ← GENIALATA Col B!
-        print(f"📊 ✅ Sheet row {row_number}: M={public_url[:60]} + B=PRODOTTO (anti-loop)", flush=True)
+                sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+                sheet.update_cell(row_number, 13, public_url)      # Col M: URL
+                sheet.update_cell(row_number, 2, "PRODOTTO")       # ← GENIALATA Col B!
+                print(f"📊 ✅ Sheet row {row_number}: M={public_url[:60]} + B=PRODOTTO (anti-loop)", flush=True)
             except Exception as e:
-        print(f"❌ Sheets fallito row {row_number}: {str(e)}", flush=True)
+                print(f"❌ Sheets fallito row {row_number}: {str(e)}", flush=True)
 
         
         # Cleanup
