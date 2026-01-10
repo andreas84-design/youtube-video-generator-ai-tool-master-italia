@@ -173,13 +173,7 @@ def process_video_async(job_id: str, data: dict):
         logger.info(f"[{job_id}] Duration: {duration/60:.1f}min")
         
         # Scene fetch (max 20)
-        # 🔥 FIX script_chunk LIST → STRING (no 'list.lower()' crash)
-script_raw = data.get("script_chunk") or data.get("script") or ""
-if isinstance(script_raw, list):
-    script_raw = ' '.join(str(s) for s in script_raw)
-logger.info(f"[{job_id}] script_raw type: {type(script_raw)}, len: {len(script_raw)}")
-script = script_raw.lower().split()
-
+        script = (data.get("script") or "").lower().split()
         keywords = data.get("keywords", "")
         avg_dur = duration / 20
         
