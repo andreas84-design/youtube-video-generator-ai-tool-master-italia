@@ -153,11 +153,19 @@ def process_video_async(job_id: str, data: dict):
         cleanup_jobs()
         
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        # 🔥 FIX: row_number sicuro senza crash
-        row_number_str = data.get('row_number', '1')
-    if isinstance(row_number_str, dict):
-        row_number_str = str(row_number_str.get('row', 1))
-        row_number = int(row_number_str)
+        
+        # 🔥 FIX BULLETPROOF row_number
+        try:
+            row_number_raw = data.get('row_number', 1)
+            if isinstance(row_number_raw, dict):
+                row_number = int(row_number_raw.get('row', 1))
+            elif isinstance(row_number_raw, str):
+                row_number = int(row_number_raw)
+            else:
+                row_number = int(row_number_raw)
+        except (ValueError, TypeError):
+            row_number = 1
+            logger.warning(f"[{job_id}] row_number invalid, using 1")
         
         jobs[job_id] = {
             'status': 'processing',
@@ -200,7 +208,6 @@ def process_video_async(job_id: str, data: dict):
         keywords = data.get("keywords", "")
         avg_dur = duration / 25
         
-        # 🔥 FIX: 25 clips invece di 15
         for i in range(30):
             word_idx = int((i * avg_dur) * (len(script) / duration)) if script else 0
             context = " ".join(script[word_idx:word_idx+5]) if word_idx < len(script) else ""
@@ -268,14 +275,13 @@ def process_video_async(job_id: str, data: dict):
         })
         logger.info(f"[{job_id}] SUCCESS: {video_url}")
         
-        # 🔥 UPDATE SHEETS colonna M (Video_URL)
         if row_number > 0 and SPREADSHEET_ID:
             try:
                 gc = get_gspread_client()
                 if gc:
                     sh = gc.open_by_key(SPREADSHEET_ID)
                     ws = sh.sheet1
-                    ws.update_cell(row_number, 13, video_url)  # Colonna M = 13
+                    ws.update_cell(row_number, 13, video_url)
                     logger.info(f"[{job_id}] Sheets updated row {row_number} col M")
             except Exception as e:
                 logger.error(f"[{job_id}] Sheets update FAIL: {e}")
