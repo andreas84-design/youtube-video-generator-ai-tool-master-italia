@@ -153,7 +153,8 @@ def process_video_async(job_id: str, data: dict):
         cleanup_jobs()
         
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
-        row_number = int(data.get('row_number') or 0)
+        # 🔥 FIX: row_number sicuro senza crash
+        row_number = int(data.get('row_number', 1)) if data.get('row_number') is not None else 1
         
         jobs[job_id] = {
             'status': 'processing',
