@@ -60,6 +60,8 @@ def cleanup_jobs():
             del jobs[k]
 
 def pick_visual_query(context: str, keywords_text: str = "") -> str:
+    if isinstance(context, list):
+        context = ' '.join(str(c) for c in context)
     ctx = (context or "").lower()
     kw = (keywords_text or "").lower()
     base = "ai workstation laptop coding workflow office technology screens"
