@@ -31,7 +31,9 @@ PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+
+# ✅ ID FISSO PER QUESTO CANALE (CAMBIA SOLO QUESTA RIGA PER GLI ALTRI CANALI)
+SPREADSHEET_ID = "1hNABNms2MdhcjY4XJK86U4e142MaCZMDIrSx5JVftqo"
 
 jobs = {}
 MAX_JOBS = 50
@@ -106,41 +108,52 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_duration: float):
         try:
             resp = requests.get(url, stream=True, timeout=30)
             resp.raise_for_status()
-            for chunk in resp.iter_content(1024*1024):
-                if chunk: tmp.write(chunk)
+            for chunk in resp.iter_iter_content(1024*1024):
+                if chunk:
+                    tmp.write(chunk)
             tmp.close()
             return tmp.name
         except:
-            try: os.unlink(tmp.name)
-            except: pass
+            try:
+                os.unlink(tmp.name)
+            except:
+                pass
             return None
     
     if PEXELS_API_KEY:
         try:
-            resp = requests.get("https://api.pexels.com/videos/search", 
-                              headers={"Authorization": PEXELS_API_KEY},
-                              params={"query": query, "orientation": "landscape", "per_page": 15, "page": random.randint(1,3)},
-                              timeout=20)
+            resp = requests.get(
+                "https://api.pexels.com/videos/search", 
+                headers={"Authorization": PEXELS_API_KEY},
+                params={"query": query, "orientation": "landscape", "per_page": 15, "page": random.randint(1,3)},
+                timeout=20
+            )
             if resp.status_code == 200:
                 videos = resp.json().get("videos", [])
                 if videos:
                     vf = random.choice(videos)["video_files"][0]
                     path = download_file(vf["link"])
-                    if path: return path, target_duration
-        except: pass
+                    if path:
+                        return path, target_duration
+        except:
+            pass
     
     if PIXABAY_API_KEY:
         try:
-            resp = requests.get("https://pixabay.com/api/videos/", 
-                              params={"key": PIXABAY_API_KEY, "q": query, "per_page": 15},
-                              timeout=20)
+            resp = requests.get(
+                "https://pixabay.com/api/videos/", 
+                params={"key": PIXABAY_API_KEY, "q": query, "per_page": 15},
+                timeout=20
+            )
             if resp.status_code == 200:
                 for hit in resp.json().get("hits", []):
                     url = hit["videos"].get("medium", {}).get("url")
                     if url:
                         path = download_file(url)
-                        if path: return path, target_duration
-        except: pass
+                        if path:
+                            return path, target_duration
+        except:
+            pass
     
     return None, None
 
@@ -154,7 +167,7 @@ def process_video_async(job_id: str, data: dict):
         
         webhook_url = data.get('webhook_url') or N8N_WEBHOOK_URL
         
-        # 🔥 FIX BULLETPROOF row_number
+        # ✅ FIX row_number robusto
         try:
             row_number_raw = data.get('row_number', 1)
             if isinstance(row_number_raw, dict):
@@ -187,14 +200,17 @@ def process_video_async(job_id: str, data: dict):
             f.write(audio_bytes)
         
         audio_wav = tempfile.mktemp(suffix='.wav')
-        subprocess.run(["ffmpeg", "-y", "-i", audiopath, "-acodec", "pcm_s16le", "-ar", "48000", audio_wav], 
-                      timeout=120, check=True, capture_output=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audiopath, "-acodec", "pcm_s16le", "-ar", "48000", audio_wav], 
+            timeout=120, check=True, capture_output=True
+        )
         os.unlink(audiopath)
         audiopath = audio_wav
         
-        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", 
-                               "-of", "csv=p=0", audiopath], 
-                              stdout=subprocess.PIPE, text=True, timeout=10)
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audiopath], 
+            stdout=subprocess.PIPE, text=True, timeout=10
+        )
         duration = float(probe.stdout.strip() or 600)
         
         logger.info(f"[{job_id}] Duration: {duration/60:.1f}min")
@@ -216,7 +232,8 @@ def process_video_async(job_id: str, data: dict):
             path, _ = fetch_clip_for_scene(i+1, query, avg_dur)
             if path:
                 scene_paths.append(path)
-            if len(scene_paths) >= 25: break
+            if len(scene_paths) >= 25:
+                break
         
         logger.info(f"[{job_id}] Clips: {len(scene_paths)}")
         if len(scene_paths) < 3:
@@ -226,15 +243,20 @@ def process_video_async(job_id: str, data: dict):
         for i, path in enumerate(scene_paths):
             norm = tempfile.mktemp(suffix='.mp4')
             try:
-                subprocess.run(["ffmpeg", "-y", "-i", path, 
-                              "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30", 
-                              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", norm], 
-                             timeout=90, check=True, capture_output=True)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", path, 
+                     "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease," 
+                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30", 
+                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", norm], 
+                    timeout=90, check=True, capture_output=True
+                )
                 if os.path.exists(norm) and os.path.getsize(norm) > 50000:
                     normalized.append(norm)
             except:
-                try: os.unlink(norm)
-                except: pass
+                try:
+                    os.unlink(norm)
+                except:
+                    pass
         
         if not normalized:
             raise RuntimeError("Nessuna clip valida")
@@ -247,16 +269,20 @@ def process_video_async(job_id: str, data: dict):
                     f.write(f"file '{p}'\n")
         
         video_looped = tempfile.mktemp(suffix='.mp4')
-        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, 
-                      "-c", "copy", "-t", str(duration), video_looped], 
-                     timeout=300, check=True, capture_output=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, 
+             "-c", "copy", "-t", str(duration), video_looped], 
+            timeout=300, check=True, capture_output=True
+        )
         os.unlink(concat_list)
         
         final_video = tempfile.mktemp(suffix='.mp4')
-        subprocess.run(["ffmpeg", "-y", "-i", video_looped, "-i", audiopath, 
-                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", 
-                      "-c:a", "aac", "-shortest", final_video], 
-                     timeout=300, check=True, capture_output=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_looped, "-i", audiopath, 
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", 
+             "-c:a", "aac", "-shortest", final_video], 
+            timeout=300, check=True, capture_output=True
+        )
         
         s3 = get_s3_client()
         key = f"videos/{dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}_{job_id}.mp4"
@@ -264,8 +290,10 @@ def process_video_async(job_id: str, data: dict):
         video_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
         
         for path in [audiopath, video_looped, final_video] + normalized + scene_paths:
-            try: os.unlink(path)
-            except: pass
+            try:
+                os.unlink(path)
+            except:
+                pass
         
         jobs[job_id].update({
             'status': 'completed',
@@ -275,28 +303,35 @@ def process_video_async(job_id: str, data: dict):
         })
         logger.info(f"[{job_id}] SUCCESS: {video_url}")
         
+        # ✅ UPDATE COLONNA M con ID FISSO
         if row_number > 0 and SPREADSHEET_ID:
             try:
                 gc = get_gspread_client()
                 if gc:
                     sh = gc.open_by_key(SPREADSHEET_ID)
                     ws = sh.sheet1
-                    ws.update_cell(row_number, 13, video_url)
+                    # Colonna M = 13
+                    ws.update_cell(row_number, 13, video_url)  # update_cell(row, col, value)[web:25][web:24]
                     logger.info(f"[{job_id}] Sheets updated row {row_number} col M")
             except Exception as e:
                 logger.error(f"[{job_id}] Sheets update FAIL: {e}")
         
         if webhook_url:
             try:
-                requests.post(webhook_url, json={
-                    'jobid': job_id,
-                    'status': 'completed',
-                    'videourl': video_url,
-                    'duration': duration,
-                    'clipsused': len(scene_paths),
-                    'row_number': row_number
-                }, timeout=10)
-            except: pass
+                requests.post(
+                    webhook_url,
+                    json={
+                        'jobid': job_id,
+                        'status': 'completed',
+                        'videourl': video_url,
+                        'duration': duration,
+                        'clipsused': len(scene_paths),
+                        'row_number': row_number
+                    },
+                    timeout=10
+                )
+            except:
+                pass
             
     except Exception as e:
         logger.error(f"[{job_id}] FAIL: {str(e)}")
@@ -305,15 +340,20 @@ def process_video_async(job_id: str, data: dict):
         
         if 'webhook_url' in jobs[job_id] and jobs[job_id]['webhook_url']:
             try:
-                requests.post(jobs[job_id]['webhook_url'], 
-                            json={'jobid': job_id, 'status': 'failed', 'error': str(e)}, 
-                            timeout=10)
-            except: pass
+                requests.post(
+                    jobs[job_id]['webhook_url'], 
+                    json={'jobid': job_id, 'status': 'failed', 'error': str(e)}, 
+                    timeout=10
+                )
+            except:
+                pass
         
         for path in [audiopath, video_looped, final_video] + scene_paths:
-            try: 
-                if path: os.unlink(path)
-            except: pass
+            try:
+                if path:
+                    os.unlink(path)
+            except:
+                pass
 
 @app.route("/generate", methods=["POST"])
 def generate():
