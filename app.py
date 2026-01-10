@@ -39,14 +39,12 @@ def get_s3_client():
             raise RuntimeError("R2_ACCOUNT_ID mancante")
         endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
         
-        session = boto3.session.Session()
-        return session.client(
+        return boto3.client(
             's3',
-            region_name=R2_REGION,
             endpoint_url=endpoint_url,
             aws_access_key_id=R2_ACCESS_KEY_ID,
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            config=Config(signature_version='s3v4', addressing_style='virtual')
+            region_name='auto'
         )
     except Exception as e:
         logger.error(f"R2 client fail: {e}")
