@@ -19,6 +19,12 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
+# 🔧 FIX 1: Railway Variables
+MAX_DURATION = int(os.getenv('MAX_DURATION', '3600'))
+MAX_CONCURRENT = int(os.getenv('MAX_CONCURRENT', '5'))
+MAX_CLIPS = int(os.getenv('MAX_CLIPS', '40'))
+LOG_RATE = int(os.getenv('LOG_RATE', '100'))
+
 app = Flask(__name__)
 
 # Config R2 (S3 compatibile)
@@ -321,7 +327,7 @@ def process_video_async(job_id, data):
         subprocess.run([
             "ffmpeg", "-y", "-loglevel", "error", "-i", audiopath_tmp,
             "-acodec", "pcm_s16le", "-ar", "48000", audio_wav_path
-        ], timeout=60, check=True)
+        ], timeout=MAX_DURATION, check=True)
         os.unlink(audiopath_tmp)
         audiopath = audio_wav_path
         
@@ -333,13 +339,16 @@ def process_video_async(job_id, data):
         real_duration = float(probe.stdout.strip() or 720.0)
         print(f"⏱️ Durata audio: {real_duration/60:.1f}min ({real_duration:.0f}s)", flush=True)
         
-        # Scene sync
+        # 🔧 FIX 2: Scene sync con MAX_CLIPS dinamico
         script_words = script.lower().split()
         words_per_second = (len(script_words) / real_duration if real_duration > 0 else 2.5)
-        avg_scene_duration = real_duration / 25
+        num_scenes = MAX_CLIPS
+        avg_scene_duration = real_duration / num_scenes
         scene_assignments = []
         
-        for i in range(25):
+        for i in range(num_scenes):
+            if i % 10 == 0:
+                print(f"🔧 Clip {i}/{num_scenes}", flush=True)
             timestamp = i * avg_scene_duration
             word_index = int(timestamp * words_per_second)
             scene_context = " ".join(script_words[word_index: word_index + 7]) if word_index < len(script_words) else "ai tool technology laptop coding workflow"
@@ -351,18 +360,17 @@ def process_video_async(job_id, data):
         
         # Download clips (ora dovrebbe prendere 20+ clip!)
         for assignment in scene_assignments:
-            print(f"📍 Scene {assignment['scene']}: {assignment['timestamp']}s → '{assignment['context']}'", flush=True)
             clip_path, clip_dur = fetch_clip_for_scene(
                 assignment["scene"], assignment["query"], avg_scene_duration
             )
             if clip_path and clip_dur:
                 scene_paths.append((clip_path, clip_dur))
         
-        print(f"✅ CLIPS SCARICATE: {len(scene_paths)}/25", flush=True)
+        print(f"✅ CLIPS SCARICATE: {len(scene_paths)}/{num_scenes}", flush=True)
         if len(scene_paths) < 5:
-            raise RuntimeError(f"Troppe poche clip: {len(scene_paths)}/25")
+            raise RuntimeError(f"Troppe poche clip: {len(scene_paths)}/{num_scenes}")
         
-        # Normalize clips
+        # 🔧 FIX 3: Normalize clips con preset fast + timeout
         normalized_clips = []
         for i, (clip_path, _dur) in enumerate(scene_paths):
             try:
@@ -372,8 +380,8 @@ def process_video_async(job_id, data):
                 subprocess.run([
                     "ffmpeg", "-y", "-loglevel", "error", "-i", clip_path,
                     "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an", normalized_path
-                ], timeout=120, check=True)
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", normalized_path
+                ], timeout=MAX_DURATION, check=True)
                 if os.path.exists(normalized_path) and os.path.getsize(normalized_path) > 1000:
                     normalized_clips.append(normalized_path)
             except Exception:
@@ -416,15 +424,16 @@ def process_video_async(job_id, data):
         video_looped_path = video_looped_tmp.name
         video_looped_tmp.close()
         
+        # 🔧 FIX 4: Concat con preset fast + timeout
         subprocess.run([
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0", "-i", concat_list_tmp.name,
             "-vf", "fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-t", str(real_duration), video_looped_path
-        ], timeout=600, check=True)
+        ], timeout=MAX_DURATION, check=True)
         os.unlink(concat_list_tmp.name)
         
-        # Final merge
+        # 🔧 FIX 5: Final merge con preset fast + timeout
         final_video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         final_video_path = final_video_tmp.name
         final_video_tmp.close()
@@ -433,9 +442,9 @@ def process_video_async(job_id, data):
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", video_looped_path, "-i", audiopath,
             "-filter_complex", "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p[v]",
-            "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-map", "[v]", "-map", "1:a", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "192k", "-shortest", final_video_path
-        ], timeout=600, check=True)
+        ], timeout=MAX_DURATION, check=True)
         
         # R2 upload
         s3_client = get_s3_client()
@@ -451,18 +460,16 @@ def process_video_async(job_id, data):
         cleanup_old_videos(s3_client, object_key)
         
         # 🔧 Sheets update BULLETPROOF
-        # DOPO R2 upload, sostituisci blocco Sheets:
         gc = get_gspread_client()
         print(f"🔍 DEBUG gspread client: {'OK' if gc else 'FAILED'}", flush=True)
         if gc and row_number > 0:
             try:
                 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
                 sheet.update_cell(row_number, 13, public_url)      # Col M: URL
-                sheet.update_cell(row_number, 2, "PRODOTTO")       # ← GENIALATA Col B!
+                sheet.update_cell(row_number, 2, "PRODOTTO")       # Col B: anti-loop!
                 print(f"📊 ✅ Sheet row {row_number}: M={public_url[:60]} + B=PRODOTTO (anti-loop)", flush=True)
             except Exception as e:
                 print(f"❌ Sheets fallito row {row_number}: {str(e)}", flush=True)
-
         
         # Cleanup
         paths_to_cleanup = [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]
