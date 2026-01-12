@@ -116,10 +116,10 @@ def notify_n8n_flusso2(job):
             "video_url": job.get("video_url"),
             "duration": job.get("duration"),
             "clips_used": job.get("clips_used"),
-            # dati passati dal flusso 1 nel /generate
+            # dati che arrivano dal flusso 1 nel /generate
             "title": job.get("data", {}).get("title"),
             "description_pro": job.get("data", {}).get("description_pro"),
-            "row_id": job.get("data", {}).get("row_id"),
+            "row_id": job.get("row_number") or job.get("data", {}).get("row_id"),  # ← FIX
             "keywords": job.get("data", {}).get("keywords"),
             "playlist": job.get("data", {}).get("playlist"),
             "channel": "ai_tool_master_italia",
