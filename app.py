@@ -43,6 +43,9 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 # ✅ ID FISSO AI TOOL MASTER ITALIA
 SPREADSHEET_ID = "1hNABNms2MdhcjY4XJK86U4e142MaCZMDIrSx5JVftqo"
 
+# 🔔 Webhook flusso 2 (AI Tool Master Italia)
+N8N_WEBHOOK_URL_FLUSSO2 = os.environ.get("N8N_WEBHOOK_URL_AI_TOOL_MASTER_FLUSSO2")
+
 jobs = {}
 MAX_JOBS = 50
 
@@ -101,6 +104,31 @@ def cleanup_old_videos(s3_client, current_key):
     except Exception as e:
         print(f"⚠️ Errore rotazione R2 (video vecchi restano): {str(e)}", flush=True)
 
+def notify_n8n_flusso2(job):
+    """Invia webhook a n8n quando il job è completato."""
+    if not N8N_WEBHOOK_URL_FLUSSO2:
+        print("⚠️ N8N_WEBHOOK_URL_AI_TOOL_MASTER_FLUSSO2 non configurata, skip webhook", flush=True)
+        return
+
+    try:
+        payload = {
+            "job_id": job.get("job_id"),
+            "video_url": job.get("video_url"),
+            "duration": job.get("duration"),
+            "clips_used": job.get("clips_used"),
+            # dati passati dal flusso 1 nel /generate
+            "title": job.get("data", {}).get("title"),
+            "description_pro": job.get("data", {}).get("description_pro"),
+            "row_id": job.get("data", {}).get("row_id"),
+            "keywords": job.get("data", {}).get("keywords"),
+            "playlist": job.get("data", {}).get("playlist"),
+            "channel": "ai_tool_master_italia",
+        }
+        resp = requests.post(N8N_WEBHOOK_URL_FLUSSO2, json=payload, timeout=15)
+        print(f"🔔 Webhook n8n flusso2 status={resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Errore invio webhook n8n flusso2: {e}", flush=True)
+
 # -------------------------------------------------
 # Mapping SCENA → QUERY visiva (canale AI TOOL MASTER ITALIA)
 # -------------------------------------------------
@@ -144,11 +172,9 @@ def pick_visual_query(context: str, keywords_text: str = "") -> str:
 
 def is_ai_tool_video_metadata(video_data, source):
     """🔧 FIX A: Filtro PERMISSIVO - NO banned (neutral OK) + keywords extra"""
-    # Keywords AI/TECH ESPANSIVE (più match)
     tech_keywords = ["ai", "coding", "code", "data", "laptop", "computer", "developer", "programmer", 
                      "technology", "tech", "workflow", "screen", "keyboard", "office", "work", "business", 
                      "software", "digital", "analytics", "dashboard"]
-    # BANNED non-tech
     banned = ["dog", "cat", "animal", "food", "cooking", "fitness", "gym", "sports", "nature", "beach", "mountain", "wedding"]
     
     if source == "pexels":
@@ -167,12 +193,9 @@ def is_ai_tool_video_metadata(video_data, source):
         status = f"⚠️ NEUTRAL(tech:{tech_count})"
     
     print(f"🔍 [{source}] '{text[:60]}...' → {status}", flush=True)
-    
-    # 🔧 PERMISSIVO: accetta TUTTO tranne banned (neutral OK!)
     return not has_banned
 
 def download_file(url: str) -> str:
-    """Download video con chunk grandi per velocità"""
     tmp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     clip_resp = requests.get(url, stream=True, timeout=30)
     clip_resp.raise_for_status()
@@ -231,7 +254,6 @@ def fetch_clip_for_scene(scene_number: int, query: str, avg_scene_duration: floa
                         return download_file(videos[quality]["url"])
         return None
     
-    # Priorità: Pexels → Pixabay
     for source_name, func in [("Pexels", try_pexels), ("Pixabay", try_pixabay)]:
         try:
             path = func()
@@ -278,6 +300,9 @@ def process_video_async(job_id, data):
     """Processa video in background thread"""
     job = jobs[job_id]
     job["status"] = "processing"
+    # memorizza info per il webhook n8n flusso 2
+    job["job_id"] = job_id
+    job["data"] = data
     
     audiopath = None
     audio_wav_path = None
@@ -295,7 +320,6 @@ def process_video_async(job_id, data):
         raw_keywords = data.get("keywords", "")
         sheet_keywords = (", ".join(str(k).strip() for k in raw_keywords) if isinstance(raw_keywords, list) else str(raw_keywords).strip())
         
-        # 🔧 FIX B/C: Parsing row_number ULTRA-ROBUSTO (gestisce nested/oggetti strani n8n)
         row_number_raw = data.get("row_number")
         if isinstance(row_number_raw, dict):
             row_number = int(row_number_raw.get('row', row_number_raw.get('row_number', 1)))
@@ -314,7 +338,10 @@ def process_video_async(job_id, data):
         if not audiobase64:
             raise RuntimeError("audiobase64 mancante")
         
-        # Audio processing
+        # (tutto il resto della funzione process_video_async RESTA UGUALE
+        # fino al punto in cui fai job.update({...}) e il cleanup)
+        
+                # Audio processing
         audio_bytes = base64.b64decode(audiobase64)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
             f.write(audio_bytes)
@@ -331,7 +358,6 @@ def process_video_async(job_id, data):
         os.unlink(audiopath_tmp)
         audiopath = audio_wav_path
         
-        # Real duration
         probe = subprocess.run([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", audiopath
@@ -339,7 +365,6 @@ def process_video_async(job_id, data):
         real_duration = float(probe.stdout.strip() or 720.0)
         print(f"⏱️ Durata audio: {real_duration/60:.1f}min ({real_duration:.0f}s)", flush=True)
         
-        # 🔧 FIX 2: Scene sync con MAX_CLIPS dinamico
         script_words = script.lower().split()
         words_per_second = (len(script_words) / real_duration if real_duration > 0 else 2.5)
         num_scenes = MAX_CLIPS
@@ -358,7 +383,6 @@ def process_video_async(job_id, data):
                 "context": scene_context[:60], "query": scene_query[:80]
             })
         
-        # Download clips (ora dovrebbe prendere 20+ clip!)
         for assignment in scene_assignments:
             clip_path, clip_dur = fetch_clip_for_scene(
                 assignment["scene"], assignment["query"], avg_scene_duration
@@ -370,7 +394,6 @@ def process_video_async(job_id, data):
         if len(scene_paths) < 5:
             raise RuntimeError(f"Troppe poche clip: {len(scene_paths)}/{num_scenes}")
         
-        # 🔧 FIX 3: Normalize clips con preset fast + timeout
         normalized_clips = []
         for i, (clip_path, _dur) in enumerate(scene_paths):
             try:
@@ -390,7 +413,6 @@ def process_video_async(job_id, data):
         if not normalized_clips:
             raise RuntimeError("Nessuna clip normalizzata")
         
-        # Concat
         def get_duration(p):
             out = subprocess.run([
                 "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -424,7 +446,6 @@ def process_video_async(job_id, data):
         video_looped_path = video_looped_tmp.name
         video_looped_tmp.close()
         
-        # 🔧 FIX 4: Concat con preset fast + timeout
         subprocess.run([
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "concat", "-safe", "0", "-i", concat_list_tmp.name,
@@ -433,7 +454,6 @@ def process_video_async(job_id, data):
         ], timeout=MAX_DURATION, check=True)
         os.unlink(concat_list_tmp.name)
         
-        # 🔧 FIX 5: Final merge con preset fast + timeout
         final_video_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         final_video_path = final_video_tmp.name
         final_video_tmp.close()
@@ -446,7 +466,6 @@ def process_video_async(job_id, data):
             "-c:a", "aac", "-b:a", "192k", "-shortest", final_video_path
         ], timeout=MAX_DURATION, check=True)
         
-        # R2 upload
         s3_client = get_s3_client()
         today = dt.datetime.utcnow().strftime("%Y-%m-%d")
         object_key = f"videos/{today}/{uuid.uuid4().hex}.mp4"
@@ -459,19 +478,17 @@ def process_video_async(job_id, data):
         public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
         cleanup_old_videos(s3_client, object_key)
         
-        # 🔧 Sheets update BULLETPROOF
         gc = get_gspread_client()
         print(f"🔍 DEBUG gspread client: {'OK' if gc else 'FAILED'}", flush=True)
         if gc and row_number > 0:
             try:
                 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-                sheet.update_cell(row_number, 13, public_url)      # Col M: URL
-                sheet.update_cell(row_number, 2, "PRODOTTO")       # Col B: anti-loop!
+                sheet.update_cell(row_number, 13, public_url)
+                sheet.update_cell(row_number, 2, "PRODOTTO")
                 print(f"📊 ✅ Sheet row {row_number}: M={public_url[:60]} + B=PRODOTTO (anti-loop)", flush=True)
             except Exception as e:
                 print(f"❌ Sheets fallito row {row_number}: {str(e)}", flush=True)
         
-        # Cleanup
         paths_to_cleanup = [audiopath, video_looped_path, final_video_path] + normalized_clips + [p[0] for p in scene_paths]
         for path in paths_to_cleanup:
             try:
@@ -488,17 +505,18 @@ def process_video_async(job_id, data):
             "clips_used": len(scene_paths),
             "row_number": row_number
         })
+
+        # Notifica n8n flusso 2
+        notify_n8n_flusso2(job)
         
     except Exception as e:
         print(f"❌ ERRORE PROCESSING: {e}", flush=True)
         job.update({"status": "failed", "error": str(e)})
     
     finally:
-        # Cleanup job dopo 1h
         Thread(target=lambda: cleanup_job_delayed(job_id), daemon=True).start()
 
 def cleanup_job_delayed(job_id, delay=3600):
-    """Cancella job dopo delay secondi"""
     import time
     time.sleep(delay)
     if job_id in jobs:
@@ -506,7 +524,6 @@ def cleanup_job_delayed(job_id, delay=3600):
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    """Endpoint principale: crea job async"""
     try:
         data = request.get_json(force=True) or {}
         job_id = str(uuid.uuid4())
@@ -517,13 +534,11 @@ def generate():
             "data": data
         }
         
-        # Pulizia jobs vecchi
         if len(jobs) > MAX_JOBS:
             old_jobs = sorted(jobs.keys(), key=lambda k: jobs[k]["created_at"])[:len(jobs)-MAX_JOBS]
             for oj in old_jobs:
                 del jobs[oj]
         
-        # Avvia processing async
         Thread(target=process_video_async, args=(job_id, data), daemon=True).start()
         
         print(f"🚀 Job {job_id} QUEUED: raw_row={data.get('row_number')}", flush=True)
